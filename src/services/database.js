@@ -73,6 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_movies_year ON movies(year);
  * @param {Object} movie - Movie object with title, url, year, quality
  */
 export async function insertMovie(movie) {
+    if (!supabase) return;
     try {
         const { error } = await supabase
             .from(TABLE_NAME)
@@ -109,7 +110,7 @@ export async function insertMovie(movie) {
  * @param {Array} movies - Array of movie objects
  */
 export async function insertMovies(movies) {
-    if (!movies || movies.length === 0) return;
+    if (!movies || movies.length === 0 || !supabase) return;
 
     try {
         const records = movies.map(movie => ({
@@ -177,6 +178,7 @@ export async function searchMovies(query) {
  * @returns {Promise<Array>} Array of movies
  */
 export async function getAllMovies(limit = 1000) {
+    if (!supabase) return [];
     try {
         const { data, error } = await supabase
             .from(TABLE_NAME)
@@ -201,6 +203,7 @@ export async function getAllMovies(limit = 1000) {
  * @returns {Promise<Object>} Database stats
  */
 export async function getStats() {
+    if (!supabase) return { totalMovies: 0 };
     try {
         const { count, error } = await supabase
             .from(TABLE_NAME)
@@ -223,6 +226,7 @@ export async function getStats() {
  * Use with caution!
  */
 export async function clearMovies() {
+    if (!supabase) return false;
     try {
         const { error } = await supabase
             .from(TABLE_NAME)
