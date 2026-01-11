@@ -1,0 +1,32 @@
+{
+    "name": "moviesda-mcp-server",
+    "version": "1.0.0",
+    "description": "MCP server to search and get download links from Moviesda",
+    "main": "src/index.js",
+    "type": "module",
+    "scripts": {
+        "start": "node src/index.js",
+        "start:stdio": "node src/stdio.js",
+        "test": "node src/scripts/test.js",
+        "dev": "node --watch src/index.js"
+    },
+    "keywords": [
+        "mcp",
+        "movies",
+        "scraper",
+        "moviesda"
+    ],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^0.6.1",
+        "@supabase/supabase-js": "^2.90.1",
+        "axios": "^1.13.2",
+        "cheerio": "^1.1.2",
+        "cors": "^2.8.5",
+        "dotenv": "^17.2.3",
+        "express": "^4.22.1",
+        "sqlite3": "^5.1.7",
+        "zcatalyst-sdk-node": "^3.1.1"
+    }
+}

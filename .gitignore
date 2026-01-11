@@ -1,0 +1,6 @@
+node_modules
+.env
+movies.db
+dist
+.vscode
+.DS_Store

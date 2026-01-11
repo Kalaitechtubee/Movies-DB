@@ -1,0 +1,30 @@
+{
+  "defaults": {
+    "project": 1,
+    "env": 1
+  },
+  "actives": {
+    "project": 1,
+    "env": 1
+  },
+  "projects": [
+    {
+      "idx": 1,
+      "id": "10673000000076006",
+      "name": "Movies-DB",
+      "domain": {
+        "id": "50037756385",
+        "name": "movies-db-60034454484.development"
+      },
+      "timezone": "Asia/Kolkata",
+      "env": [
+        {
+          "idx": 1,
+          "id": "60034454484",
+          "name": "Development",
+          "type": 3
+        }
+      ]
+    }
+  ]
+}
