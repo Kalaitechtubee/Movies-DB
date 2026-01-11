@@ -36,10 +36,12 @@ app.use((req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-    console.log("=================================");
-    console.log("Moviesda MCP Server Started");
-    console.log("Listening on port:", PORT);
-    console.log("=================================");
+    logger.info(`Moviesda MCP Server running on port ${PORT}`);
+    if (!process.env.ZOHO_CATALYST_LISTEN_PORT) {
+        logger.info(`REST API: http://localhost:${PORT}/api/search?q=movie_name`);
+        logger.info(`MCP SSE: http://localhost:${PORT}/sse`);
+        logger.info(`Health: http://localhost:${PORT}/health`);
+    }
 });
 
 export default app;
