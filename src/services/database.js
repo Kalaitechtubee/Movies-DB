@@ -14,6 +14,10 @@ const TABLE_NAME = 'movies';
  * This function just verifies the connection
  */
 export async function initDb() {
+    if (!supabase) {
+        logger.error('Database client not initialized. Check your environment variables.');
+        return false;
+    }
     try {
         // Test connection by querying the movies table
         const { data, error } = await supabase
@@ -145,6 +149,7 @@ export async function insertMovies(movies) {
  * @returns {Promise<Array>} Array of matching movies
  */
 export async function searchMovies(query) {
+    if (!supabase) return [];
     try {
         const { data, error } = await supabase
             .from(TABLE_NAME)
