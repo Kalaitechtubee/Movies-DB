@@ -110,7 +110,11 @@ export async function insertMovie(movie) {
  * @param {Array} movies - Array of movie objects
  */
 export async function insertMovies(movies) {
-    if (!movies || movies.length === 0 || !supabase) return;
+    if (!movies || movies.length === 0) return;
+    if (!supabase) {
+        logger.error('Cannot insert movies: Supabase client not initialized');
+        return;
+    }
 
     try {
         const records = movies.map(movie => ({

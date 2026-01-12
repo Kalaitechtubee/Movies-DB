@@ -6,7 +6,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { BASE_URL, REQUEST_HEADERS, SCRAPE_CONFIG } from '../config.js';
-import { insertMovie } from './database.js';
+import { insertMovie, insertMovies } from './database.js';
 import logger from '../utils/logger.js';
 import { fuzzyMatch } from '../utils/search.js';
 
@@ -335,7 +335,10 @@ export async function searchMoviesDirect(query) {
     }));
 
     // Cache results in database
-    detailedResults.forEach(movie => insertMovie(movie));
+    if (detailedResults.length > 0) {
+        await insertMovies(detailedResults);
+        logger.info(`Cached ${detailedResults.length} movies in database`);
+    }
 
     logger.info(`Found ${detailedResults.length} detailed results for "${query}"`);
     return detailedResults;
