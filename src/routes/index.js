@@ -7,7 +7,7 @@ import express from 'express';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { mcpServer } from '../mcp/server.js';
 import { searchMovies, getStats } from '../services/database.js';
-import { scrapeHome, searchMoviesDirect } from '../services/scraper.js';
+import { scrapeHome, searchMoviesDirect, getMovieDownloadLinks } from '../services/scraper.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
@@ -85,10 +85,24 @@ router.get('/api/search', async (req, res) => {
             source = 'direct';
         }
 
+        // For each result, get full details if they aren't comprehensive
+        const detailedResults = await Promise.all(results.map(async (movie) => {
+            try {
+                // If it's a direct link or missing resolutions, fetch them
+                if (!movie.resolutions || movie.resolutions.length === 0) {
+                    const details = await getMovieDownloadLinks(movie.url);
+                    return details ? { ...movie, ...details } : movie;
+                }
+            } catch (err) {
+                logger.warn(`Failed to enrich movie details for ${movie.title}: ${err.message}`);
+            }
+            return movie;
+        }));
+
         res.json({
-            count: results.length,
+            count: detailedResults.length,
             source,
-            results
+            results: detailedResults
         });
     } catch (error) {
         logger.error('Search error:', error.message);

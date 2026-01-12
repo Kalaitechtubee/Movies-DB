@@ -8,6 +8,106 @@ import * as cheerio from 'cheerio';
 import { BASE_URL, REQUEST_HEADERS, SCRAPE_CONFIG } from '../config.js';
 import { insertMovie } from './database.js';
 import logger from '../utils/logger.js';
+import { fuzzyMatch } from '../utils/search.js';
+
+/**
+ * Follow download server links to find the direct file link
+ * @param {string} url - Initial download server URL
+ * @returns {Promise<Object>} Object containing directLink and watchLink
+ */
+async function followDownloadLinks(url) {
+    let currentUrl = url;
+    let result = { directLink: null, watchLink: null };
+
+    // Max depth of 5 to prevent infinite loops
+    for (let i = 0; i < 5; i++) {
+        logger.debug(`Following link level ${i}: ${currentUrl}`);
+        const $ = await fetchPage(currentUrl);
+        if (!$) {
+            logger.warn(`Failed to fetch level ${i}: ${currentUrl}`);
+            break;
+        }
+
+        // 1. Look for direct file links (mp4, mkv or known hosts)
+        let foundLink = null;
+        $('a').each((_, el) => {
+            const href = $(el).attr('href');
+            const text = $(el).text().trim();
+            if (!href) return;
+
+            // Direct file extensions
+            if (href.match(/\.(mp4|mkv|avi|webm)$/i)) {
+                foundLink = href;
+                return false;
+            }
+
+            // Known file host patterns
+            const knownHosts = [
+                'hotshare.link', 'uptobox.com', '1fichier.com', 'pixeldrain.com',
+                'biggshare.xyz', 'cdnserver', 'onestream.watch', 'gofile.io',
+                'drive.google.com', 'mega.nz', 'mediafire.com'
+            ];
+            if (knownHosts.some(host => href.includes(host))) {
+                foundLink = href;
+                return false;
+            }
+
+            // If "Download Server" text points to an external site, it's likely the final destination
+            // We'll accept any "Download" link that leads away from our ecosystem
+            if (text.match(/Download Server/i) && href.startsWith('http') &&
+                !href.includes('moviesda') && !href.includes('moviespage') && !href.includes('downloadpage')) {
+                foundLink = href;
+                return false;
+            }
+        });
+
+        if (foundLink) {
+            result.directLink = foundLink;
+
+            // Checks for watch link
+            if (foundLink.includes('onestream.watch')) {
+                result.watchLink = foundLink;
+            } else {
+                // While we're here, look for watch online links on the same page
+                const watchOnline = $('a:contains("Watch Online")').first().attr('href') ||
+                    $('a[href*="onestream.watch"]').first().attr('href');
+                if (watchOnline) result.watchLink = watchOnline;
+            }
+            break;
+        }
+
+        // 2. Look for "Watch Online" specifically if not found yet
+        if (!result.watchLink) {
+            const watchOnline = $('a:contains("Watch Online")').first().attr('href') ||
+                $('a[href*="onestream.watch"]').first().attr('href');
+            if (watchOnline) result.watchLink = watchOnline;
+        }
+
+        // 3. Look for the next "Download Server" link
+        const nextLink = $('a:contains("Download Server 1")').first().attr('href') ||
+            $('a:contains("Download Server")').first().attr('href') ||
+            $('a:contains("Download")').first().attr('href');
+
+        if (nextLink && nextLink !== currentUrl && !nextLink.match(/\.(mp4|mkv)$/i)) {
+            const previousUrl = currentUrl;
+            // Handle relative URLs
+            if (nextLink.startsWith('http')) {
+                currentUrl = nextLink;
+            } else if (nextLink.startsWith('/')) {
+                const urlObj = new URL(currentUrl);
+                currentUrl = `${urlObj.protocol}//${urlObj.host}${nextLink}`;
+            } else {
+                // Just use BASE_URL as fallback for absolute-ish paths
+                currentUrl = `${BASE_URL}${nextLink.startsWith('/') ? '' : '/'}${nextLink}`;
+            }
+            logger.debug(`Moving to next link: ${currentUrl} (from ${previousUrl})`);
+        } else {
+            logger.debug(`No more links found at level ${i}`);
+            break;
+        }
+    }
+    return result;
+}
 
 /**
  * Fetch and parse a webpage
@@ -106,17 +206,27 @@ async function scrapeAllPages(baseUrl, maxPages, year = 'Unknown') {
     const pagesToScrape = Math.min(totalPages, maxPages);
     logger.info(`Scraping ${pagesToScrape} pages from ${baseUrl}`);
 
-    // Fetch remaining pages
-    for (let page = 2; page <= pagesToScrape; page++) {
-        const separator = baseUrl.includes('?') ? '&' : '?';
-        const pageUrl = `${baseUrl}${separator}page=${page}`;
+    // Fetch remaining pages in batches to be faster but polite
+    const CONCURRENT_BATCH = 5;
+    const remainingPages = [];
+    for (let p = 2; p <= pagesToScrape; p++) remainingPages.push(p);
 
-        logger.debug(`Fetching page ${page}: ${pageUrl}`);
-        const $page = await fetchPage(pageUrl);
+    for (let i = 0; i < remainingPages.length; i += CONCURRENT_BATCH) {
+        const batch = remainingPages.slice(i, i + CONCURRENT_BATCH);
+        const batchPromises = batch.map(async (page) => {
+            const separator = baseUrl.includes('?') ? '&' : '?';
+            const pageUrl = `${baseUrl}${separator}page=${page}`;
 
-        if ($page) {
-            allMovies.push(...parseMovies($page, year));
-        }
+            logger.debug(`Fetching page ${page}: ${pageUrl}`);
+            const $page = await fetchPage(pageUrl);
+            if ($page) {
+                return parseMovies($page, year);
+            }
+            return [];
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        batchResults.forEach(movies => allMovies.push(...movies));
     }
 
     return allMovies;
@@ -179,7 +289,8 @@ export async function searchMoviesDirect(query) {
     // 1. Search A-Z category
     const firstChar = normalizedQuery.charAt(0);
     if (/[a-z]/.test(firstChar)) {
-        const movies = await scrapeAllPages(`${BASE_URL}/tamil-movies/${firstChar}/`, 10, 'Unknown');
+        // Scrape deeper (25 pages) to find movies
+        const movies = await scrapeAllPages(`${BASE_URL}/tamil-movies/${firstChar}/`, 25, 'Unknown');
         potentialMovies.push(...movies);
     }
 
@@ -199,7 +310,7 @@ export async function searchMoviesDirect(query) {
         });
 
         for (const item of yearLinks.filter(y => parseInt(y.year) >= 2024)) {
-            const movies = await scrapeAllPages(item.url, 5, item.year);
+            const movies = await scrapeAllPages(item.url, 15, item.year);
             potentialMovies.push(...movies);
         }
     }
@@ -207,7 +318,7 @@ export async function searchMoviesDirect(query) {
     // 3. Filter and deduplicate
     const uniqueMovies = new Map();
     potentialMovies.forEach(movie => {
-        if (movie.title.toLowerCase().includes(normalizedQuery)) {
+        if (fuzzyMatch(movie.title, query)) {
             uniqueMovies.set(movie.url, movie);
         }
     });
@@ -242,7 +353,7 @@ export async function getMovieDownloadLinks(movieUrl) {
     if (!$) return null;
 
     const details = {
-        title: $('h1').text().trim().replace(/ Tamil Movie$/, ''),
+        title: ($('h1').text() || $('.line').first().text()).trim().replace(/ Tamil Movie$/, ''),
         posterUrl: $('.movie-info-container img').first().attr('src') || $('.f img').first().attr('src') || null,
         director: '',
         starring: '',
@@ -316,15 +427,15 @@ export async function getMovieDownloadLinks(movieUrl) {
         const $res = await fetchPage(res.url);
         if (!$res) continue;
 
-        $res('.f a').each((_, el) => {
-            const text = $res(el).text();
+        $res('.f a, .folder a, a.coral').each((_, el) => {
+            const text = $res(el).text().trim();
             const href = $res(el).attr('href');
 
-            if (href && (text.includes('.mp4') || text.includes('BD') || text.includes('Rip') || text.includes('HD'))) {
+            if (href && (text.toLowerCase().includes('.mp4') || text.toLowerCase().includes('.mkv') || text.includes('HD') || text.includes('Rip'))) {
                 details.resolutions.push({
                     quality: res.text,
                     name: text,
-                    url: href.startsWith('http') ? href : `${BASE_URL}${href}`
+                    url: href.startsWith('http') ? href : `${BASE_URL}${href.startsWith('/') ? '' : '/'}${href}`
                 });
             }
         });
@@ -335,9 +446,39 @@ export async function getMovieDownloadLinks(movieUrl) {
         const $file = await fetchPage(item.url);
         if (!$file) continue;
 
-        const downloadLink = $file('a:contains("Download Server 1")').attr('href');
+        // Try to find download server link directly
+        let downloadLink = $file('a:contains("Download Server 1")').attr('href') ||
+            $file('a:contains("Download Server")').attr('href');
+
+        // If not found, it might be a sub-folder (like Amaran case: Original -> 1080p -> File -> Download)
+        // We are at "1080p". We need to find "File".
+        if (!downloadLink) {
+            const subFileLink = $file('.f a, .folder a, a.coral').filter((_, el) => {
+                const text = $file(el).text().toLowerCase();
+                return text.includes('.mp4') || text.includes('.mkv');
+            }).first().attr('href');
+
+            if (subFileLink) {
+                const fullSubUrl = subFileLink.startsWith('http') ? subFileLink : `${BASE_URL}${subFileLink.startsWith('/') ? '' : '/'}${subFileLink}`;
+                logger.debug(`Found sub-file link, following: ${fullSubUrl}`);
+                const $subFile = await fetchPage(fullSubUrl);
+                if ($subFile) {
+                    downloadLink = $subFile('a:contains("Download Server 1")').attr('href') ||
+                        $subFile('a:contains("Download Server")').attr('href');
+                }
+            }
+        }
+
         if (downloadLink) {
-            item.downloadUrl = downloadLink;
+            const fullDlUrl = downloadLink.startsWith('http') ? downloadLink : `${BASE_URL}${downloadLink}`;
+            const finalLinks = await followDownloadLinks(fullDlUrl);
+            item.downloadUrl = downloadLink; // Original server link
+            item.directUrl = finalLinks.directLink;
+            item.watchUrl = finalLinks.watchLink;
+
+            if (finalLinks.directLink) {
+                logger.info(`Successfully found direct link for ${item.name}: ${finalLinks.directLink}`);
+            }
         }
     }
 

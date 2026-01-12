@@ -166,7 +166,9 @@ async function handleGetDownloadLinks(args) {
     if (validLinks.length > 0) {
         text += `⬇️ **Download Links:**\n`;
         validLinks.forEach(res => {
-            text += `\n• **${res.quality}**\n  File: ${res.name}\n  Link: ${res.downloadUrl}\n`;
+            text += `\n• **${res.quality}**\n  File: ${res.name}\n  Server: ${res.downloadUrl}\n`;
+            if (res.directUrl) text += `  ⚡ Direct DL: ${res.directUrl}\n`;
+            if (res.watchUrl) text += `  🎬 Watch Online: ${res.watchUrl}\n`;
         });
     } else {
         text += '\n⚠️ No download links available at this time.';
