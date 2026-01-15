@@ -345,12 +345,14 @@ export async function searchMoviesDirect(query) {
 }
 
 /**
- * Get download links for a specific movie
+ * Get download links for a specific movie or web series
+ * Recursively explores folders to find actual file links
  * @param {string} movieUrl - URL of the movie page
- * @returns {Promise<Object|null>} Movie details with download links
+ * @param {string} query - Optional search query to filter specific episodes/seasons
+ * @returns {Promise<Object|null>} Movie details with resolutions/episodes
  */
-export async function getMovieDownloadLinks(movieUrl) {
-    logger.info(`Fetching detailed movie info for: ${movieUrl}`);
+export async function getMovieDownloadLinks(movieUrl, query = '') {
+    logger.info(`Fetching detailed media info for: ${movieUrl} (Query: ${query})`);
 
     const $ = await fetchPage(movieUrl);
     if (!$) return null;
@@ -371,10 +373,10 @@ export async function getMovieDownloadLinks(movieUrl) {
     };
 
     if (details.posterUrl && !details.posterUrl.startsWith('http')) {
-        details.posterUrl = `${BASE_URL}${details.posterUrl}`;
+        details.posterUrl = `${BASE_URL}${details.posterUrl.startsWith('/') ? '' : '/'}${details.posterUrl}`;
     }
 
-    // Parse Detailed Movie Info from <ul>
+    // Parse Detailed Media Info
     $('.movie-info li').each((_, el) => {
         const label = $(el).find('strong').text().replace(':', '').trim();
         const value = $(el).find('span').text().trim();
@@ -390,102 +392,178 @@ export async function getMovieDownloadLinks(movieUrl) {
         }
     });
 
-    // Parse Synopsis
-    const synopsisText = $('.movie-synopsis').text().replace('Synopsis:', '').trim();
-    details.synopsis = synopsisText;
+    details.synopsis = $('.movie-synopsis').text().replace('Synopsis:', '').trim();
 
     // Parse Screenshots
     $('.screenshot-container img').each((_, el) => {
         let src = $(el).attr('src');
         if (src) {
-            if (!src.startsWith('http')) src = `${BASE_URL}${src}`;
+            if (!src.startsWith('http')) src = `${BASE_URL}${src.startsWith('/') ? '' : '/'}${src}`;
             details.screenshots.push(src);
         }
     });
 
-    // Find resolution links (Original, HD, etc.)
-    const resolutionLinks = [];
-    $('.f a').each((_, el) => {
-        const text = $(el).text();
-        const href = $(el).attr('href');
+    const discoveredFiles = new Map();
+    const visited = new Set();
 
-        if (!href || href.includes('folder.svg')) return;
+    // Parse target episode/season from query
+    let targetEpi = null;
+    let targetSeason = null;
+    if (query) {
+        const epiMatch = query.match(/E(?:p|pisode)?\s?(\d+)/i) || query.match(/(\d+)(?:st|nd|rd|th)?\s?Episode/i);
+        const seasonMatch = query.match(/S(?:eason)?\s?(\d+)/i) || query.match(/Season\s?(\d+)/i);
+        if (epiMatch) targetEpi = parseInt(epiMatch[1]);
+        if (seasonMatch) targetSeason = parseInt(seasonMatch[1]);
+    }
 
-        if (text.includes('HD') || text.includes('Original') || text.includes('DVD')) {
-            resolutionLinks.push({
-                text,
-                url: href.startsWith('http') ? href : `${BASE_URL}${href}`
-            });
-        } else if (text.match(/\.(mp4|mkv)|Sample/i)) {
-            details.resolutions.push({
-                quality: 'Direct',
-                name: text,
-                url: href.startsWith('http') ? href : `${BASE_URL}${href}`
-            });
+    /**
+     * Helper to recursively find file links
+     */
+    async function explore(url, currentQuality = 'Unknown', depth = 0) {
+        if (depth > 6 || visited.has(url)) return; // Increased depth for big series
+        visited.add(url);
+
+        const $page = await fetchPage(url);
+        if (!$page) return;
+
+        const links = [];
+        $page('.f a, .folder a, a.coral, .line a, .pagination a').each((_, el) => {
+            const text = $page(el).text().trim();
+            const href = $page(el).attr('href');
+            if (!href || href.includes('folder.svg') || href.includes('index.html')) return;
+
+            // Filter out A-Z and common clutter
+            if (text.length <= 3 && depth === 0 && !href.includes('?page=')) return;
+            if (/^[A-Z]$/.test(text) || text === '0-9' || text === 'Disclaimer' || text === 'Home') return;
+
+            // Robust relative URL handling
+            let fullUrl;
+            try {
+                if (href.startsWith('http')) {
+                    fullUrl = href;
+                } else if (href.startsWith('/')) {
+                    fullUrl = `${BASE_URL}${href}`;
+                } else {
+                    const baseUrlObj = new URL(url);
+                    const basePath = baseUrlObj.pathname.substring(0, baseUrlObj.pathname.lastIndexOf('/') + 1);
+                    fullUrl = `${baseUrlObj.origin}${basePath}${href}`;
+                }
+                links.push({ text, url: fullUrl });
+            } catch (err) {
+                logger.debug(`Failed to parse URL ${href} relative to ${url}`);
+            }
+        });
+
+        for (const link of links) {
+            const text = link.text;
+            const linkUrl = link.url;
+
+            const isFile = text.match(/\.(mp4|mkv|avi|webm)$/i) || text.includes('Sample');
+            const isEpisode = text.match(/Epi|Episode|Day|Part/i);
+            const isQuality = text.match(/HD|Original|720p|1080p|DVD|HDRip|BDRip|Tamil/i);
+            const hasMovieKeyword = text.match(/Movie|Full|Series|Season/i);
+            const isPagination = linkUrl.includes('?page=') || (text.match(/^\d+$/) && depth < 2);
+
+            // If specific episode requested, check if this link is it
+            if (targetEpi !== null && (isEpisode || text.includes(` (${targetEpi})`))) {
+                const linkEpiMatch = text.match(/E(?:p|pisode)?\s?(\d+)/i) || text.match(/Day\s?(\d+)/i);
+                if (linkEpiMatch && parseInt(linkEpiMatch[1]) !== targetEpi) {
+                    // This is an episode but not the target one
+                    if (!isFile) continue;
+                }
+            }
+
+            if (isFile) {
+                if (!discoveredFiles.has(linkUrl)) {
+                    discoveredFiles.set(linkUrl, {
+                        quality: currentQuality,
+                        name: text,
+                        url: linkUrl
+                    });
+                }
+            } else if (isPagination || isQuality || isEpisode || hasMovieKeyword || depth < 4) {
+                let nextQuality = currentQuality;
+                if (isQuality && !isEpisode) {
+                    nextQuality = text;
+                } else if (isEpisode && currentQuality === 'Unknown') {
+                    nextQuality = 'Episode';
+                }
+
+                const nextDepth = isPagination ? depth : depth + 1;
+                await explore(linkUrl, nextQuality, nextDepth);
+            }
         }
+    }
+
+    await explore(movieUrl, details.quality, 0);
+
+    // Natural sort episodes: Epi 101 should come after Epi 2
+    const sortedResolutions = Array.from(discoveredFiles.values()).sort((a, b) => {
+        const aNum = a.name.match(/(\d+)/)?.[0];
+        const bNum = b.name.match(/(\d+)/)?.[0];
+        if (aNum && bNum) return parseInt(bNum) - parseInt(aNum); // Newest first
+        return b.name.localeCompare(a.name);
     });
 
-    // Fetch file links from resolution pages
-    for (const res of resolutionLinks) {
-        const $res = await fetchPage(res.url);
-        if (!$res) continue;
+    details.resolutions = sortedResolutions;
 
-        $res('.f a, .folder a, a.coral').each((_, el) => {
-            const text = $res(el).text().trim();
-            const href = $res(el).attr('href');
+    const CONCURRENCY_LIMIT = 5; // Slightly faster
+    const itemsToProcess = details.resolutions.slice(0, 100);
 
-            if (href && (text.toLowerCase().includes('.mp4') || text.toLowerCase().includes('.mkv') || text.includes('HD') || text.includes('Rip'))) {
-                details.resolutions.push({
-                    quality: res.text,
-                    name: text,
-                    url: href.startsWith('http') ? href : `${BASE_URL}${href.startsWith('/') ? '' : '/'}${href}`
-                });
+    for (let i = 0; i < itemsToProcess.length; i += CONCURRENCY_LIMIT) {
+        const batch = itemsToProcess.slice(i, i + CONCURRENCY_LIMIT);
+        await Promise.all(batch.map(async (item) => {
+            try {
+                const $file = await fetchPage(item.url);
+                if (!$file) return;
+
+                let downloadLink = $file('a:contains("Download Server 1")').attr('href') ||
+                    $file('a:contains("Download Server")').attr('href') ||
+                    $file('a:contains("Download")').attr('href');
+
+                if (!downloadLink) {
+                    const subLink = $file('.f a, .folder a, a.coral').filter((_, el) => {
+                        const t = $file(el).text().toLowerCase();
+                        return t.includes('.mp4') || t.includes('.mkv') || t.includes('sample');
+                    }).first().attr('href');
+
+                    if (subLink) {
+                        const fullSubUrl = subLink.startsWith('http') ? subLink :
+                            subLink.startsWith('/') ? `${BASE_URL}${subLink}` :
+                                `${item.url.substring(0, item.url.lastIndexOf('/') + 1)}${subLink}`;
+                        const $sub = await fetchPage(fullSubUrl);
+                        if ($sub) {
+                            downloadLink = $sub('a:contains("Download Server 1")').attr('href') ||
+                                $sub('a:contains("Download Server")').attr('href');
+                        }
+                    }
+                }
+
+                if (downloadLink) {
+                    const fullDlUrl = downloadLink.startsWith('http') ? downloadLink :
+                        downloadLink.startsWith('/') ? `${BASE_URL}${downloadLink}` :
+                            `${item.url.substring(0, item.url.lastIndexOf('/') + 1)}${downloadLink}`;
+
+                    const finalLinks = await followDownloadLinks(fullDlUrl);
+                    item.downloadUrl = fullDlUrl;
+                    item.directUrl = finalLinks.directLink;
+                    item.watchUrl = finalLinks.watchLink;
+                }
+            } catch (err) {
+                logger.warn(`Error processing file link ${item.url}: ${err.message}`);
             }
+        }));
+    }
+
+    // Filter results if target episode specified
+    if (targetEpi !== null) {
+        details.resolutions = details.resolutions.filter(r => {
+            const rEpiMatch = r.name.match(/E(?:p|pisode)?\s?(\d+)/i) || r.name.match(/Day\s?(\d+)/i) || r.name.includes(`(${targetEpi})`);
+            return rEpiMatch && parseInt(rEpiMatch[1] || targetEpi) === targetEpi;
         });
     }
 
-    // Get actual download links from file pages
-    for (const item of details.resolutions) {
-        const $file = await fetchPage(item.url);
-        if (!$file) continue;
-
-        // Try to find download server link directly
-        let downloadLink = $file('a:contains("Download Server 1")').attr('href') ||
-            $file('a:contains("Download Server")').attr('href');
-
-        // If not found, it might be a sub-folder (like Amaran case: Original -> 1080p -> File -> Download)
-        // We are at "1080p". We need to find "File".
-        if (!downloadLink) {
-            const subFileLink = $file('.f a, .folder a, a.coral').filter((_, el) => {
-                const text = $file(el).text().toLowerCase();
-                return text.includes('.mp4') || text.includes('.mkv');
-            }).first().attr('href');
-
-            if (subFileLink) {
-                const fullSubUrl = subFileLink.startsWith('http') ? subFileLink : `${BASE_URL}${subFileLink.startsWith('/') ? '' : '/'}${subFileLink}`;
-                logger.debug(`Found sub-file link, following: ${fullSubUrl}`);
-                const $subFile = await fetchPage(fullSubUrl);
-                if ($subFile) {
-                    downloadLink = $subFile('a:contains("Download Server 1")').attr('href') ||
-                        $subFile('a:contains("Download Server")').attr('href');
-                }
-            }
-        }
-
-        if (downloadLink) {
-            const fullDlUrl = downloadLink.startsWith('http') ? downloadLink : `${BASE_URL}${downloadLink}`;
-            const finalLinks = await followDownloadLinks(fullDlUrl);
-            item.downloadUrl = downloadLink; // Original server link
-            item.directUrl = finalLinks.directLink;
-            item.watchUrl = finalLinks.watchLink;
-
-            if (finalLinks.directLink) {
-                logger.info(`Successfully found direct link for ${item.name}: ${finalLinks.directLink}`);
-            }
-        }
-    }
-
-    logger.info(`Found ${details.resolutions.length} download options for ${details.title}`);
+    logger.info(`Found ${details.resolutions.length} options for ${details.title}`);
     return details;
 }
 
@@ -522,3 +600,4 @@ export async function scrapeHome() {
 
     logger.info('Home page scrape completed');
 }
+

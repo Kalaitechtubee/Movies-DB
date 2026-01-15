@@ -90,7 +90,7 @@ router.get('/api/search', async (req, res) => {
             try {
                 // If it's a direct link or missing resolutions, fetch them
                 if (!movie.resolutions || movie.resolutions.length === 0) {
-                    const details = await getMovieDownloadLinks(movie.url);
+                    const details = await getMovieDownloadLinks(movie.url, query);
                     return details ? { ...movie, ...details } : movie;
                 }
             } catch (err) {
