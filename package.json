@@ -27,6 +27,7 @@
         "dotenv": "^17.2.3",
         "express": "^4.22.1",
         "sqlite3": "^5.1.7",
+        "winston": "^3.19.0",
         "zcatalyst-sdk-node": "^3.1.1"
     }
 }

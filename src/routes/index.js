@@ -7,10 +7,36 @@ import express from 'express';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { mcpServer } from '../mcp/server.js';
 import { searchMovies, getStats, getAllMovies, insertMovie, insertMovies } from '../services/database.js';
-import { scrapeHome, searchMoviesDirect, getMovieDownloadLinks, getCategories, getCategoryMovies, getIsaidubLatest, getMovieDetails, getLatestUpdates } from '../services/scraper.js';
+import { scrapeHome, searchMoviesDirect, searchAllDirect, getMovieDownloadLinks, getCategories, getCategoryMovies, getIsaidubLatest, getMovieDetails, getLatestUpdates, getTeluguLatest, getWebSeriesLatest } from '../services/scraper.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
+
+/**
+ * Get Latest Telugu Movies Endpoint
+ */
+router.get('/api/movies/telugu', async (req, res) => {
+    try {
+        const results = await getTeluguLatest();
+        res.json(results);
+    } catch (error) {
+        logger.error('Telugu movies error:', error.message);
+        res.status(500).json({ error: 'Failed' });
+    }
+});
+
+/**
+ * Get Latest Web Series Endpoint
+ */
+router.get('/api/movies/webseries', async (req, res) => {
+    try {
+        const results = await getWebSeriesLatest();
+        res.json(results);
+    } catch (error) {
+        logger.error('WebSeries error:', error.message);
+        res.status(500).json({ error: 'Failed' });
+    }
+});
 
 // Store active SSE transports
 const transports = new Map();
@@ -80,8 +106,8 @@ router.get('/api/search', async (req, res) => {
         let source = 'database';
 
         if (results.length === 0) {
-            logger.info(`No DB results for "${query}", performing direct search...`);
-            results = await searchMoviesDirect(query);
+            logger.info(`No DB results for "${query}", performing comprehensive direct search...`);
+            results = await searchAllDirect(query);
             source = 'direct';
         }
 
