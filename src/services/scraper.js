@@ -242,7 +242,10 @@ async function getMovieDetails(url) {
     if (!$) return null;
 
     const details = {
-        poster_url: $('.movie-info-container img').first().attr('src') || $('.f img').first().attr('src') || null,
+        poster_url: $('.movie-info-container source[type="image/webp"]').first().attr('srcset')?.split(' ')[0] ||
+            $('.movie-info-container img').first().attr('src') ||
+            $('.f img').filter((i, el) => !$(el).attr('src')?.includes('folder')).first().attr('src') ||
+            null,
         director: '',
         starring: '',
         genres: '',
@@ -254,7 +257,7 @@ async function getMovieDetails(url) {
     };
 
     if (details.poster_url && !details.poster_url.startsWith('http')) {
-        details.poster_url = `${BASE_URL}${details.poster_url}`;
+        details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
     }
 
     $('.movie-info li').each((_, el) => {
@@ -359,7 +362,10 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
 
     const details = {
         title: ($('h1').text() || $('.line').first().text()).trim().replace(/ Tamil Movie$/, ''),
-        posterUrl: $('.movie-info-container img').first().attr('src') || $('.f img').first().attr('src') || null,
+        poster_url: $('.movie-info-container source[type="image/webp"]').first().attr('srcset')?.split(' ')[0] ||
+            $('.movie-info-container img').first().attr('src') ||
+            $('.f img').filter((i, el) => !$(el).attr('src')?.includes('folder')).first().attr('src') ||
+            null,
         director: '',
         starring: '',
         genres: '',
@@ -372,9 +378,10 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
         resolutions: []
     };
 
-    if (details.posterUrl && !details.posterUrl.startsWith('http')) {
-        details.posterUrl = `${BASE_URL}${details.posterUrl.startsWith('/') ? '' : '/'}${details.posterUrl}`;
+    if (details.poster_url && !details.poster_url.startsWith('http')) {
+        details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
     }
+
 
     // Parse Detailed Media Info
     $('.movie-info li').each((_, el) => {
@@ -567,6 +574,95 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
     return details;
 }
 
+
+
+
+/**
+ * Get all categories from home page
+ * @returns {Promise<Array>} Array of category objects
+ */
+export async function getCategories() {
+    logger.info('Fetching categories...');
+    const $ = await fetchPage(BASE_URL);
+    if (!$) return [];
+
+    const categories = [];
+
+    // 1. Get main categories (Year based)
+    $('.line:contains("Moviesda Downloads")').nextUntil('.line').find('.f a').each((_, el) => {
+        const name = $(el).text().trim();
+        const href = $(el).attr('href');
+        if (href && name) {
+            categories.push({
+                name,
+                url: href.startsWith('http') ? href : `${BASE_URL}${href}`,
+                section: 'Moviesda Downloads'
+            });
+        }
+    });
+
+    // 2. Get More Categories
+    $('.line:contains("More Categories")').nextUntil('.line').find('.f a').each((_, el) => {
+        const name = $(el).text().trim();
+        const href = $(el).attr('href');
+        if (href && name) {
+            categories.push({
+                name,
+                url: href.startsWith('http') ? href : `${BASE_URL}${href}`,
+                section: 'More Categories'
+            });
+        }
+    });
+
+    logger.info(`Found ${categories.length} categories`);
+    return categories;
+}
+
+/**
+ * Get movies from a specific category
+ * @param {string} categoryUrl - URL of the category
+ * @param {string} year - Year to assign
+ * @param {boolean} enrich - Whether to fetch direct download links for each movie
+ */
+export async function getCategoryMovies(categoryUrl, year = 'Unknown', enrich = false) {
+    logger.info(`Scraping category: ${categoryUrl} (Enrich: ${enrich})`);
+
+    // Scrape first page only for quick results, or more if needed
+    const movies = await scrapeAllPages(categoryUrl, 1, year);
+
+    if (!enrich) return movies;
+
+    // If enrich is requested, fetch full details for each movie
+    // Use a smaller batch size to avoid overwhelming the server
+    const enrichedMovies = [];
+    const BATCH_SIZE = 3;
+
+    for (let i = 0; i < movies.length; i += BATCH_SIZE) {
+        const batch = movies.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(batch.map(async (movie) => {
+            try {
+                const details = await getMovieDownloadLinks(movie.url);
+                return details ? { ...movie, ...details } : movie;
+            } catch (err) {
+                logger.warn(`Failed to enrich category movie ${movie.title}: ${err.message}`);
+                return movie;
+            }
+        }));
+        enrichedMovies.push(...results);
+
+        // Break early if we have enough enriched movies for a category view (e.g., 12)
+        if (enrichedMovies.length >= 12) break;
+    }
+
+    // Cache enriched movies if any were found
+    if (enrichedMovies.length > 0) {
+        await insertMovies(enrichedMovies);
+        logger.info(`Cached ${enrichedMovies.length} enriched category movies in database`);
+    }
+
+    return enrichedMovies;
+}
+
 /**
  * Scrape home page and populate database
  * Used for initial database population
@@ -574,30 +670,35 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
 export async function scrapeHome() {
     logger.info('Starting home page scrape...');
 
-    const $ = await fetchPage(BASE_URL);
-    if (!$) return;
+    const categories = await getCategories();
+    const yearCategories = categories.filter(c => c.name.match(/Tamil \d{4} Movies/));
 
-    const yearLinks = [];
-    $('.f a').each((_, el) => {
-        const text = $(el).text();
-        const href = $(el).attr('href');
+    logger.info(`Processing ${yearCategories.length} year categories for database population`);
 
-        if (text.match(/Tamil \d{4} Movies/) && href) {
-            yearLinks.push({
-                url: href.startsWith('http') ? href : `${BASE_URL}${href}`,
-                year: text.match(/\d{4}/)[0]
-            });
-        }
-    });
+    for (const item of yearCategories) {
+        const yearMatch = item.name.match(/\d{4}/);
+        const year = yearMatch ? yearMatch[0] : 'Unknown';
 
-    logger.info(`Found ${yearLinks.length} year categories`);
+        // Get the list of movies
+        const movies = await scrapeAllPages(item.url, 1, year);
 
-    for (const item of yearLinks) {
-        const movies = await scrapeAllPages(item.url, 5, item.year);
-        movies.forEach(movie => insertMovie(movie));
-        logger.info(`Scraped ${movies.length} movies from ${item.year}`);
+        // Enrich the first 10 movies with details (posters, director, etc.)
+        const topMovies = movies.slice(0, 10);
+        const enrichedTop = await Promise.all(topMovies.map(async (movie) => {
+            try {
+                const details = await getMovieDownloadLinks(movie.url);
+                return details ? { ...movie, ...details } : movie;
+            } catch (err) {
+                return movie;
+            }
+        }));
+
+        // Combine and insert
+        const finalBatch = [...enrichedTop, ...movies.slice(10)];
+        await insertMovies(finalBatch);
+
+        logger.info(`Scraped ${movies.length} movies from ${item.name} (Enriched ${enrichedTop.length} with posters)`);
     }
 
     logger.info('Home page scrape completed');
 }
-

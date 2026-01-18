@@ -93,7 +93,7 @@ export async function insertMovie(movie) {
                 },
                 {
                     onConflict: 'url',
-                    ignoreDuplicates: true
+                    ignoreDuplicates: false
                 }
             );
 
@@ -135,7 +135,7 @@ export async function insertMovies(movies) {
             .from(TABLE_NAME)
             .upsert(records, {
                 onConflict: 'url',
-                ignoreDuplicates: true
+                ignoreDuplicates: false
             });
 
         if (error) {

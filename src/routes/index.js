@@ -6,8 +6,8 @@
 import express from 'express';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { mcpServer } from '../mcp/server.js';
-import { searchMovies, getStats } from '../services/database.js';
-import { scrapeHome, searchMoviesDirect, getMovieDownloadLinks } from '../services/scraper.js';
+import { searchMovies, getStats, getAllMovies, insertMovie, insertMovies } from '../services/database.js';
+import { scrapeHome, searchMoviesDirect, getMovieDownloadLinks, getCategories, getCategoryMovies } from '../services/scraper.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
@@ -85,11 +85,14 @@ router.get('/api/search', async (req, res) => {
             source = 'direct';
         }
 
-        // For each result, get full details if they aren't comprehensive
-        const detailedResults = await Promise.all(results.map(async (movie) => {
+        // Limit enrichment to first 10 for performance, do rest in background
+        const toEnrich = results.slice(0, 10);
+        const remaining = results.slice(10);
+
+        const detailedResults = await Promise.all(toEnrich.map(async (movie) => {
             try {
-                // If it's a direct link or missing resolutions, fetch them
-                if (!movie.resolutions || movie.resolutions.length === 0) {
+                // If poster is missing or it's a direct link/missing resolutions, fetch them
+                if (!movie.poster_url || !movie.resolutions || movie.resolutions.length === 0) {
                     const details = await getMovieDownloadLinks(movie.url, query);
                     return details ? { ...movie, ...details } : movie;
                 }
@@ -99,14 +102,33 @@ router.get('/api/search', async (req, res) => {
             return movie;
         }));
 
+        // Background enrichment for the rest
+        if (remaining.length > 0) {
+            remaining.forEach(async (movie) => {
+                try {
+                    if (!movie.poster_url || !movie.resolutions || movie.resolutions.length === 0) {
+                        const details = await getMovieDownloadLinks(movie.url, query);
+                        if (details) await insertMovie({ ...movie, ...details });
+                    }
+                } catch (err) { /* ignore */ }
+            });
+        }
+
+        const finalResults = [...detailedResults, ...remaining];
+
+        // Persist enriched results to database
+        if (detailedResults.length > 0) {
+            await insertMovies(detailedResults);
+        }
+
         res.json({
-            count: detailedResults.length,
+            count: finalResults.length,
             source,
-            results: detailedResults
+            results: finalResults
         });
     } catch (error) {
-        logger.error('Search error:', error.message);
-        res.status(500).json({ error: 'Search failed' });
+        logger.error(`Search error for query "${query}":`, error);
+        res.status(500).json({ error: 'Search failed', details: error.message });
     }
 });
 
@@ -150,6 +172,122 @@ router.get('/api/stats', async (req, res) => {
     } catch (error) {
         logger.error('Stats error:', error.message);
         res.status(500).json({ error: 'Failed to get stats' });
+    }
+});
+
+/**
+ * Get Categories Endpoint
+ */
+router.get('/api/categories', async (req, res) => {
+    try {
+        const categories = await getCategories();
+        res.json(categories);
+    } catch (error) {
+        logger.error('Categories error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch categories' });
+    }
+});
+
+/**
+ * Get Category Movies Endpoint
+ */
+router.get('/api/movies/category', async (req, res) => {
+    const url = req.query.url;
+    const year = req.query.year || 'Unknown';
+    const enrich = req.query.enrich === 'true';
+
+    if (!url) {
+        return res.status(400).json({ error: 'Missing url parameter' });
+    }
+
+    try {
+        const results = await getCategoryMovies(url, year, enrich);
+        res.json({
+            count: results.length,
+            results
+        });
+    } catch (error) {
+        logger.error('Category movies error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch category movies' });
+    }
+});
+
+/**
+ * Get Recent Movies Endpoint
+ */
+router.get('/api/movies/recent', async (req, res) => {
+    const limit = parseInt(req.query.limit) || 20;
+    try {
+        const results = await getAllMovies(limit);
+
+        // Background enrichment for movies missing posters
+        const moviesMissingPosters = results.filter(m => !m.poster_url);
+        if (moviesMissingPosters.length > 0) {
+            // Only process a small batch to not slow down the response
+            const toEnrich = moviesMissingPosters.slice(0, 5);
+            Promise.all(toEnrich.map(async (movie) => {
+                try {
+                    const details = await getMovieDetails(movie.url);
+                    if (details && details.poster_url) {
+                        await insertMovie({ ...movie, ...details });
+                        logger.debug(`Background enriched poster for: ${movie.title}`);
+                    }
+                } catch (err) {
+                    // Ignore background errors
+                }
+            }));
+        }
+
+        res.json(results);
+    } catch (error) {
+        logger.error('Recent movies error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch recent movies' });
+    }
+});
+
+/**
+ * Get Latest (Trending) Movies Endpoint
+ */
+router.get('/api/movies/latest', async (req, res) => {
+    try {
+        // For "latest", we can either scrape home or get from DB
+        const results = await getAllMovies(15);
+
+        // Enrichment for missing posters in latest movies (crucial for homepage)
+        // Split into "immediate" (await) and "background" to avoid slow page load
+        const toEnrichImmediate = results.slice(0, 5);
+        const remaining = results.slice(5);
+
+        const enrichedImmediate = await Promise.all(toEnrichImmediate.map(async (movie) => {
+            if (!movie.poster_url) {
+                try {
+                    const details = await getMovieDetails(movie.url);
+                    if (details) {
+                        const updated = { ...movie, ...details };
+                        await insertMovie(updated);
+                        return updated;
+                    }
+                } catch (err) {
+                    logger.debug(`Failed to enrich latest movie ${movie.title}: ${err.message}`);
+                }
+            }
+            return movie;
+        }));
+
+        // Do the rest in background
+        remaining.forEach(async (movie) => {
+            if (!movie.poster_url) {
+                try {
+                    const details = await getMovieDetails(movie.url);
+                    if (details) await insertMovie({ ...movie, ...details });
+                } catch (err) { }
+            }
+        });
+
+        res.json([...enrichedImmediate, ...remaining]);
+    } catch (error) {
+        logger.error('Latest movies error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch latest movies' });
     }
 });
 
