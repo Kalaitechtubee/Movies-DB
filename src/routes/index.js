@@ -7,7 +7,7 @@ import express from 'express';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { mcpServer } from '../mcp/server.js';
 import { searchMovies, getStats, getAllMovies, insertMovie, insertMovies } from '../services/database.js';
-import { scrapeHome, searchMoviesDirect, getMovieDownloadLinks, getCategories, getCategoryMovies } from '../services/scraper.js';
+import { scrapeHome, searchMoviesDirect, getMovieDownloadLinks, getCategories, getCategoryMovies, getIsaidubLatest, getMovieDetails, getLatestUpdates } from '../services/scraper.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
@@ -250,13 +250,18 @@ router.get('/api/movies/recent', async (req, res) => {
  */
 router.get('/api/movies/latest', async (req, res) => {
     try {
-        // For "latest", we can either scrape home or get from DB
-        const results = await getAllMovies(15);
+        // For "latest", we prioritize live updates from the website
+        let results = await getLatestUpdates();
+
+        if (!results || results.length === 0) {
+            logger.info('Live updates empty, falling back to database');
+            results = await getAllMovies(15);
+        }
 
         // Enrichment for missing posters in latest movies (crucial for homepage)
         // Split into "immediate" (await) and "background" to avoid slow page load
-        const toEnrichImmediate = results.slice(0, 5);
-        const remaining = results.slice(5);
+        const toEnrichImmediate = results.slice(0, 6);
+        const remaining = results.slice(6);
 
         const enrichedImmediate = await Promise.all(toEnrichImmediate.map(async (movie) => {
             if (!movie.poster_url) {
@@ -264,7 +269,7 @@ router.get('/api/movies/latest', async (req, res) => {
                     const details = await getMovieDetails(movie.url);
                     if (details) {
                         const updated = { ...movie, ...details };
-                        await insertMovie(updated);
+                        await insertMovie(updated); // Cache it
                         return updated;
                     }
                 } catch (err) {
@@ -288,6 +293,35 @@ router.get('/api/movies/latest', async (req, res) => {
     } catch (error) {
         logger.error('Latest movies error:', error.message);
         res.status(500).json({ error: 'Failed to fetch latest movies' });
+    }
+});
+
+/**
+ * Get Latest isaiDub Movies Endpoint
+ */
+router.get('/api/movies/isaidub', async (req, res) => {
+    try {
+        const results = await getIsaidubLatest();
+
+        // Enrich the results with posters
+        const enrichedResults = await Promise.all(results.map(async (movie) => {
+            try {
+                const details = await getMovieDetails(movie.url);
+                return details ? { ...movie, ...details } : movie;
+            } catch (err) {
+                return movie;
+            }
+        }));
+
+        // Insert into DB for caching
+        if (enrichedResults.length > 0) {
+            await insertMovies(enrichedResults);
+        }
+
+        res.json(enrichedResults);
+    } catch (error) {
+        logger.error('Isaidub latest movies error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch isaidub latest movies' });
     }
 });
 

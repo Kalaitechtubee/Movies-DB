@@ -5,7 +5,7 @@
 
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { BASE_URL, REQUEST_HEADERS, SCRAPE_CONFIG } from '../config.js';
+import { BASE_URL, ISAIDUB_BASE_URL, REQUEST_HEADERS, SCRAPE_CONFIG } from '../config.js';
 import { insertMovie, insertMovies } from './database.js';
 import logger from '../utils/logger.js';
 import { fuzzyMatch } from '../utils/search.js';
@@ -237,7 +237,7 @@ async function scrapeAllPages(baseUrl, maxPages, year = 'Unknown') {
  * @param {string} url - Movie URL
  * @returns {Promise<Object>} Detailed movie info
  */
-async function getMovieDetails(url) {
+export async function getMovieDetails(url) {
     const $ = await fetchPage(url);
     if (!$) return null;
 
@@ -257,7 +257,8 @@ async function getMovieDetails(url) {
     };
 
     if (details.poster_url && !details.poster_url.startsWith('http')) {
-        details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        const urlObj = new URL(url);
+        details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
     }
 
     $('.movie-info li').each((_, el) => {
@@ -379,7 +380,8 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
     };
 
     if (details.poster_url && !details.poster_url.startsWith('http')) {
-        details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        const urlObj = new URL(movieUrl);
+        details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
     }
 
 
@@ -405,7 +407,10 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
     $('.screenshot-container img').each((_, el) => {
         let src = $(el).attr('src');
         if (src) {
-            if (!src.startsWith('http')) src = `${BASE_URL}${src.startsWith('/') ? '' : '/'}${src}`;
+            if (!src.startsWith('http')) {
+                const urlObj = new URL(movieUrl);
+                src = `${urlObj.origin}${src.startsWith('/') ? '' : '/'}${src}`;
+            }
             details.screenshots.push(src);
         }
     });
@@ -449,7 +454,8 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
                 if (href.startsWith('http')) {
                     fullUrl = href;
                 } else if (href.startsWith('/')) {
-                    fullUrl = `${BASE_URL}${href}`;
+                    const urlObj = new URL(url);
+                    fullUrl = `${urlObj.origin}${href}`;
                 } else {
                     const baseUrlObj = new URL(url);
                     const basePath = baseUrlObj.pathname.substring(0, baseUrlObj.pathname.lastIndexOf('/') + 1);
@@ -701,4 +707,102 @@ export async function scrapeHome() {
     }
 
     logger.info('Home page scrape completed');
+}
+/**
+ * Get latest movies from Moviesda latest updates page
+ * @returns {Promise<Array>} Array of latest movies
+ */
+export async function getLatestUpdates() {
+    logger.info('Fetching Moviesda latest updates...');
+    const url = `${BASE_URL}/tamil-latest-updates/`;
+    const $ = await fetchPage(url);
+    if (!$) return [];
+
+    const movies = [];
+    $('.f').each((_, el) => {
+        const link = $(el).find('a').first();
+        const href = link.attr('href');
+
+        // Try to get title from various possible tags
+        let title = $(el).find('b').text().trim() ||
+            $(el).find('strong').text().trim() ||
+            link.text().trim();
+
+        if (href && title) {
+            // Filter out purely navigational text
+            if (title.toLowerCase().includes('check out our') || title.length < 3) return;
+
+            // If title is just "Download Now" or similar, try to parse it from the URL
+            if (title.toLowerCase() === 'download now' || title.toLowerCase() === 'download') {
+                const slug = href.split('/').filter(Boolean).pop() || '';
+                title = slug.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+                // Capitalize words
+                title = title.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+            }
+
+            const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
+            const yearMatch = title.match(/\((\d{4})\)/) || title.match(/\s(\d{4})\s/) || fullUrl.match(/(\d{4})/);
+            const year = yearMatch ? yearMatch[1] : 'Unknown';
+
+            movies.push({
+                title: title.replace(/\(\d{4}\)/, '').replace(/\d{4}.*/, '').trim(),
+                url: fullUrl,
+                year,
+                quality: 'DVD/HD'
+            });
+        }
+    });
+
+    // Filter to only include recent movies (>= 2024)
+    const recentMovies = movies.filter(m => {
+        if (m.year === 'Unknown') return true;
+        const y = parseInt(m.year);
+        return y >= 2024 && y <= 2027; // Filter out 2017 etc.
+    }).slice(0, 15);
+
+    logger.info(`Found ${recentMovies.length} recent movies from updates`);
+    return recentMovies;
+}
+
+/**
+ * Get latest updates from isaiDub
+ * @returns {Promise<Array>} Array of latest dubbed movies
+ */
+export async function getIsaidubLatest() {
+    logger.info('Fetching isaiDub latest updates...');
+    const $ = await fetchPage(ISAIDUB_BASE_URL);
+    if (!$) return [];
+
+    const movies = [];
+    const latestSection = $('.line:contains("isaiDub Latest Updates")');
+
+    if (latestSection.length > 0) {
+        latestSection.nextUntil('.line', '.f').each((_, el) => {
+            const link = $(el).find('a:contains("Download Now")').first();
+            const href = link.attr('href');
+
+            // Get title - it's usually inside <strong> or <b> before the rating
+            let title = $(el).find('strong, b').first().text().trim();
+            if (!title) {
+                // Fallback title extraction
+                title = $(el).text().split('(')[0].trim();
+            }
+
+            if (href && title &&
+                !title.includes('Check out our Latest Updates') &&
+                !href.includes('tamil-dubbed-movies-download')) {
+                const fullUrl = href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`;
+                movies.push({
+                    title,
+                    url: fullUrl,
+                    year: title.match(/\(\d{4}\)/)?.[0]?.replace(/[()]/g, '') || 'Unknown',
+                    quality: 'DVD/HD',
+                    source: 'isaidub'
+                });
+            }
+        });
+    }
+
+    logger.info(`Found ${movies.length} isaiDub updates`);
+    return movies;
 }
