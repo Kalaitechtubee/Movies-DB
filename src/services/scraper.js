@@ -32,11 +32,48 @@ export function cleanTitle(title) {
 /**
  * Follow download server links to find the direct file link
  * @param {string} url - Initial download server URL
- * @returns {Promise<Object>} Object containing directLink and watchLink
+ * @returns {Promise<Object>} Object containing directLink, watchLink and streamSource
  */
+async function getStreamSource(watchUrl) {
+    if (!watchUrl || (!watchUrl.includes('onestream.watch') && !watchUrl.includes('biggshare.xyz'))) return null;
+    try {
+        const response = await axios.get(watchUrl, {
+            headers: REQUEST_HEADERS,
+            timeout: 5000
+        });
+        const $ = cheerio.load(response.data);
+
+        // 1. Check for standard video source tag
+        let source = $('video source').attr('src');
+
+        // 2. Check for video tag src
+        if (!source) source = $('video').attr('src');
+
+        // 3. Search for scripts containing direct links
+        if (!source) {
+            $('script').each((i, el) => {
+                const text = $(el).html();
+                if (text && (text.includes('source: "') || text.includes('file: "'))) {
+                    const match = text.match(/source:\s*["'](.+?)["']/) || text.match(/file:\s*["'](.+?)["']/);
+                    if (match) source = match[1];
+                }
+            });
+        }
+
+        if (source && !source.startsWith('http')) {
+            const urlObj = new URL(watchUrl);
+            source = `${urlObj.origin}${source.startsWith('/') ? '' : '/'}${source}`;
+        }
+
+        return source;
+    } catch (error) {
+        logger.warn(`Failed to get stream source for ${watchUrl}: ${error.message}`);
+        return null;
+    }
+}
 async function followDownloadLinks(url) {
     let currentUrl = url;
-    let result = { directLink: null, watchLink: null };
+    let result = { directLink: null, watchLink: null, streamSource: null };
 
     // Max depth of 5 to prevent infinite loops
     for (let i = 0; i < 5; i++) {
@@ -63,7 +100,7 @@ async function followDownloadLinks(url) {
             // Known file host patterns including vidfiles
             const knownHosts = [
                 'hotshare.link', 'uptobox.com', '1fichier.com', 'pixeldrain.com',
-                'biggshare.xyz', 'cdnserver', 'onestream.watch', 'gofile.io',
+                'biggshare.xyz', 'cdnserver', 'onestream.watch', 'play.onestream.watch', 'gofile.io',
                 'drive.google.com', 'mega.nz', 'mediafire.com', 'vidfiles.'
             ];
             if (knownHosts.some(host => href.includes(host))) {
@@ -129,6 +166,13 @@ async function followDownloadLinks(url) {
             break;
         }
     }
+    // New: If we have a watchLink, try to get the direct stream source
+    if (result.watchLink) {
+        result.streamSource = await getStreamSource(result.watchLink);
+    } else if (result.directLink && result.directLink.includes('onestream.watch')) {
+        result.streamSource = await getStreamSource(result.directLink);
+    }
+
     return result;
 }
 
@@ -293,42 +337,61 @@ export async function getMovieDetails(url) {
         details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
     }
 
-    $('.movie-info li').each((_, el) => {
-        const label = $(el).find('strong').text().replace(':', '').trim();
-        const value = $(el).find('span').text().trim();
-
-        switch (label) {
-            case 'Director': details.director = value; break;
-            case 'Starring': details.starring = value; break;
-            case 'Genres': details.genres = value; break;
-            case 'Quality': details.quality = value; break;
-            case 'Language': details.language = value; break;
-            case 'Movie Rating': details.rating = value; break;
-            case 'Last Updated': details.lastUpdated = value; break;
+    $('.movie-info li, .isai .pro b').each((_, el) => {
+        let label, value;
+        if ($(el).is('li')) {
+            label = $(el).find('strong').text().replace(':', '').trim();
+            value = $(el).find('span').text().trim();
+        } else {
+            label = $(el).text().replace(':', '').trim();
+            value = $(el).next().next('font').text().trim() || $(el).next().next().text().trim();
         }
+
+        if (!label || !value) return;
+
+        const lowerLabel = label.toLowerCase();
+        if (lowerLabel.includes('director')) details.director = value;
+        else if (lowerLabel.includes('starring') || lowerLabel.includes('cast')) details.starring = value;
+        else if (lowerLabel.includes('genres') || lowerLabel.includes('category')) details.genres = value;
+        else if (lowerLabel.includes('quality')) details.quality = value;
+        else if (lowerLabel.includes('language')) details.language = value;
+        else if (lowerLabel.includes('rating')) details.rating = value;
+        else if (lowerLabel.includes('last updated') || lowerLabel.includes('release')) details.lastUpdated = value;
     });
 
     details.synopsis = $('.movie-synopsis').text().replace('Synopsis:', '').trim() ||
-        $('.isai-panel.isai-note p').text().replace('Story/Plot:', '').trim();
+        $('.isai-panel.isai-note p').text().replace('Story/Plot:', '').trim() ||
+        $('.description').text().trim();
 
-    // Handle moviesda27 specific format (.isai .pro)
-    if (!details.director || !details.starring) {
-        $('.isai .pro b').each((i, el) => {
-            const label = $(el).text().trim();
-            const value = $(el).next().next('font').text().trim() || $(el).next().next().text().trim();
+    // Fallback: If no metadata found, try to look for any image that looks like a poster
+    if (!details.poster_url) {
+        // Try to find images that are medium sized and not small icons
+        $('img').each((_, img) => {
+            const src = $(img).attr('src');
+            if (src && !src.includes('folder') && !src.includes('loader') && !src.includes('icon')) {
+                const lowerSrc = src.toLowerCase();
+                const isPosterPattern = lowerSrc.includes('poster') || lowerSrc.includes('thumb') ||
+                    lowerSrc.includes('series') || lowerSrc.includes('season');
+                const isImageExt = lowerSrc.endsWith('.webp') || lowerSrc.endsWith('.jpg') ||
+                    lowerSrc.endsWith('.jpeg') || lowerSrc.endsWith('.png');
 
-            if (label.includes('Movie Name')) {
-                // skip
-            } else if (label.includes('Starring')) {
-                details.starring = value;
-            } else if (label.includes('Genres')) {
-                details.genres = value;
-            } else if (label.includes('Quality')) {
-                details.quality = value;
-            } else if (label.includes('Language')) {
-                details.language = value;
+                if (isPosterPattern || isImageExt) {
+                    details.poster_url = src;
+                    return false; // break
+                }
             }
         });
+    }
+
+    // Final cleanup for poster URL - ensure it's an absolute URL
+    if (details.poster_url && !details.poster_url.startsWith('http')) {
+        try {
+            const urlObj = new URL(url);
+            details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        } catch (e) {
+            // If URL parsing fails, fallback to BASE_URL
+            details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        }
     }
 
     return details;
@@ -417,9 +480,12 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
 
     const details = {
         title: ($('h1').text() || $('.line').first().text()).trim().replace(/ Tamil Movie$/, ''),
-        poster_url: $('.movie-info-container source[type="image/webp"]').first().attr('srcset')?.split(' ')[0] ||
+        poster_url: $('meta[property="og:image"]').attr('content') ||
+            $('link[rel="image_src"]').attr('href') ||
+            $('.movie-info-container source[type="image/webp"]').first().attr('srcset')?.split(' ')[0] ||
             $('.movie-info-container img').first().attr('src') ||
-            $('.f img').filter((i, el) => !$(el).attr('src')?.includes('folder')).first().attr('src') ||
+            $('.header-poster img').first().attr('src') ||
+            $('.f img').filter((i, el) => !$(el).attr('src')?.includes('folder') && !$(el).attr('src')?.includes('loader')).first().attr('src') ||
             null,
         director: '',
         starring: '',
@@ -434,28 +500,71 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
     };
 
     if (details.poster_url && !details.poster_url.startsWith('http')) {
-        const urlObj = new URL(movieUrl);
-        details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        try {
+            const urlObj = new URL(movieUrl);
+            details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        } catch (e) {
+            details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        }
     }
 
 
     // Parse Detailed Media Info
-    $('.movie-info li').each((_, el) => {
-        const label = $(el).find('strong').text().replace(':', '').trim();
-        const value = $(el).find('span').text().trim();
-
-        switch (label) {
-            case 'Director': details.director = value; break;
-            case 'Starring': details.starring = value; break;
-            case 'Genres': details.genres = value; break;
-            case 'Quality': details.quality = value; break;
-            case 'Language': details.language = value; break;
-            case 'Movie Rating': details.rating = value; break;
-            case 'Last Updated': details.lastUpdated = value; break;
+    $('.movie-info li, .isai .pro b').each((_, el) => {
+        let label, value;
+        if ($(el).is('li')) {
+            label = $(el).find('strong').text().replace(':', '').trim();
+            value = $(el).find('span').text().trim();
+        } else {
+            label = $(el).text().replace(':', '').trim();
+            value = $(el).next().next('font').text().trim() || $(el).next().next().text().trim();
         }
+
+        if (!label || !value) return;
+
+        const lowerLabel = label.toLowerCase();
+        if (lowerLabel.includes('director')) details.director = value;
+        else if (lowerLabel.includes('starring') || lowerLabel.includes('cast')) details.starring = value;
+        else if (lowerLabel.includes('genres') || lowerLabel.includes('category')) details.genres = value;
+        else if (lowerLabel.includes('quality')) details.quality = value;
+        else if (lowerLabel.includes('language')) details.language = value;
+        else if (lowerLabel.includes('rating')) details.rating = value;
+        else if (lowerLabel.includes('last updated') || lowerLabel.includes('release')) details.lastUpdated = value;
     });
 
-    details.synopsis = $('.movie-synopsis').text().replace('Synopsis:', '').trim();
+    details.synopsis = $('.movie-synopsis').text().replace('Synopsis:', '').trim() ||
+        $('.isai-panel.isai-note p').text().replace('Story/Plot:', '').trim() ||
+        $('.description').text().trim();
+
+    // Fallback: If no metadata found, try to look for any image that looks like a poster
+    if (!details.poster_url) {
+        // Try to find images that are medium sized and not small icons
+        $('img').each((_, img) => {
+            const src = $(img).attr('src');
+            if (src && !src.includes('folder') && !src.includes('loader') && !src.includes('icon')) {
+                const lowerSrc = src.toLowerCase();
+                const isPosterPattern = lowerSrc.includes('poster') || lowerSrc.includes('thumb') ||
+                    lowerSrc.includes('series') || lowerSrc.includes('season');
+                const isImageExt = lowerSrc.endsWith('.webp') || lowerSrc.endsWith('.jpg') ||
+                    lowerSrc.endsWith('.jpeg') || lowerSrc.endsWith('.png');
+
+                if (isPosterPattern || isImageExt) {
+                    details.poster_url = src;
+                    return false; // break
+                }
+            }
+        });
+    }
+
+    // Final cleanup for poster URL - ensure it's an absolute URL
+    if (details.poster_url && !details.poster_url.startsWith('http')) {
+        try {
+            const urlObj = new URL(movieUrl);
+            details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        } catch (e) {
+            details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+        }
+    }
 
     // Parse Screenshots
     $('.screenshot-container img').each((_, el) => {
@@ -618,6 +727,37 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
                     item.downloadUrl = fullDlUrl;
                     item.directUrl = finalLinks.directLink;
                     item.watchUrl = finalLinks.watchLink;
+                    item.streamSource = finalLinks.streamSource;
+
+                    // Extract size from name if possible (e.g. "Movie Name (950 MB).mp4")
+                    const sizeMatch = item.name.match(/\(([\d\.]+\s*(?:MB|GB|KB))\)/i);
+                    if (sizeMatch) {
+                        item.size = sizeMatch[1];
+                    }
+
+                    // Try to get exact size from headers if we have a direct link
+                    if (item.directUrl && !item.size) {
+                        try {
+                            const headRes = await axios.head(item.directUrl, {
+                                timeout: 2000,
+                                headers: { 'User-Agent': 'Mozilla/5.0' }
+                            });
+                            const contentLength = headRes.headers['content-length'];
+                            if (contentLength) {
+                                const bytes = parseInt(contentLength);
+                                if (bytes > 0) {
+                                    const mb = (bytes / (1024 * 1024)).toFixed(1);
+                                    if (mb > 1024) {
+                                        item.size = (mb / 1024).toFixed(2) + ' GB';
+                                    } else {
+                                        item.size = mb + ' MB';
+                                    }
+                                }
+                            }
+                        } catch (hErr) {
+                            // Silently fail if head request fails
+                        }
+                    }
                 }
             } catch (err) {
                 logger.warn(`Error processing file link ${item.url}: ${err.message}`);
@@ -655,7 +795,8 @@ export async function getCategories() {
     $('.line:contains("Moviesda Downloads")').nextUntil('.line').find('.f a').each((_, el) => {
         const name = $(el).text().trim();
         const href = $(el).attr('href');
-        if (href && name) {
+        // IMPORTANT: Only include Tamil categories
+        if (href && name && name.toLowerCase().includes('tamil')) {
             categories.push({
                 name,
                 url: href.startsWith('http') ? href : `${BASE_URL}${href}`,
@@ -668,7 +809,8 @@ export async function getCategories() {
     $('.line:contains("More Categories")').nextUntil('.line').find('.f a').each((_, el) => {
         const name = $(el).text().trim();
         const href = $(el).attr('href');
-        if (href && name) {
+        // IMPORTANT: Only include Tamil categories
+        if (href && name && name.toLowerCase().includes('tamil')) {
             categories.push({
                 name,
                 url: href.startsWith('http') ? href : `${BASE_URL}${href}`,
@@ -677,7 +819,7 @@ export async function getCategories() {
         }
     });
 
-    logger.info(`Found ${categories.length} categories`);
+    logger.info(`Found ${categories.length} Tamil categories`);
     return categories;
 }
 
@@ -814,14 +956,22 @@ export async function getLatestUpdates() {
         }
     });
 
-    // Filter to only include recent movies (>= 2024)
+    // Filter to only include recent movies (>= 2024) and only Tamil/Dubbed content
     const recentMovies = movies.filter(m => {
+        const titleLower = m.title.toLowerCase();
+
+        // Skip other languages if they don't include Tamil
+        const otherLangs = ['telugu', 'hindi', 'malayalam', 'kannada', 'english'];
+        const isOtherLang = otherLangs.some(lang => titleLower.includes(lang)) && !titleLower.includes('tamil');
+
+        if (isOtherLang) return false;
+
         if (m.year === 'Unknown') return true;
         const y = parseInt(m.year);
         return y >= 2024 && y <= 2027; // Filter out 2017 etc.
     }).slice(0, 15);
 
-    logger.info(`Found ${recentMovies.length} recent movies from updates`);
+    logger.info(`Found ${recentMovies.length} recent Tamil/Dubbed movies from updates`);
     return recentMovies;
 }
 
@@ -845,7 +995,10 @@ export async function getIsaidubLatest() {
             const href = link.attr('href');
             let title = $(el).text().split('(')[0].trim();
 
-            if (href && title && !title.includes('Updates')) {
+            // Filter for Tamil content
+            const isTamil = title.toLowerCase().includes('tamil') || href?.toLowerCase().includes('tamil');
+
+            if (href && title && isTamil && !title.includes('Updates')) {
                 const fullUrl = href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`;
                 movies.push({
                     title,
@@ -863,10 +1016,12 @@ export async function getIsaidubLatest() {
         $('a[href*="/movie/"]').each((_, el) => {
             const href = $(el).attr('href');
             const title = $(el).text().trim();
-            // Filter out generic links
-            if (title && !title.includes('Download') && !title.includes('Collection') && !title.includes('Updates')) {
+
+            // Strictly Tamil only
+            const isTamil = title.toLowerCase().includes('tamil') || href.toLowerCase().includes('tamil');
+
+            if (title && isTamil && !title.includes('Download') && !title.includes('Collection') && !title.includes('Updates')) {
                 const fullUrl = href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`;
-                // Avoid duplicates if possible, though Set logic handles it later
                 movies.push({
                     title,
                     url: fullUrl,
@@ -882,62 +1037,7 @@ export async function getIsaidubLatest() {
     return movies;
 }
 
-/**
- * Get latest Telugu movies
- * FAST VERSION: Uses cached updates, quick homepage links, and eventually dubbed fallback
- * @returns {Promise<Array>} Array of latest Telugu movies
- */
-export async function getTeluguLatest() {
-    logger.info('Fetching latest Telugu movies...');
 
-    const updates = await getLatestUpdates();
-    let teluguMovies = updates.filter(m =>
-        m.title.toLowerCase().includes('telugu') ||
-        m.url.toLowerCase().includes('telugu')
-    );
-
-    // If we found enough specific Telugu updates, return them
-    if (teluguMovies.length >= 5) {
-        logger.info(`Found ${teluguMovies.length} Telugu movies from home updates`);
-        return teluguMovies;
-    }
-
-    // Try scraping specific category if possible (existing logic)
-    // ... [We can keep the existing scraping logic here if desired, or simplify] ...
-
-
-
-    // Deduplicate
-    const unique = Array.from(new Map(teluguMovies.map(m => [m.url, m])).values()).slice(0, 15);
-
-    // AWAIT Enrichment to ensure posters are sent to client
-    if (unique.length > 0) {
-        logger.info(`Enriching ${unique.length} items with details...`);
-        // We await here so the client gets the posters immediately
-        await Promise.all(unique.slice(0, 8).map(async (movie) => {
-            try {
-                if (!movie.poster_url && !movie.posterUrl) {
-                    const details = await getMovieDetails(movie.url);
-                    if (details) {
-                        const originalLang = movie.language;
-                        Object.assign(movie, details);
-                        // Persist forced language if set
-                        if (originalLang === 'Telugu') {
-                            movie.language = 'Telugu';
-                        }
-                    }
-                }
-            } catch (err) {
-                logger.warn(`Failed to enrich movie ${movie.title}: ${err.message}`);
-            }
-        }));
-
-        // Save to DB in background
-        insertMovies(unique).catch(() => { });
-    }
-
-    return unique;
-}
 
 /**
  * Get latest Tamil Web Series
@@ -968,28 +1068,38 @@ export async function getWebSeriesLatest() {
             ...m,
             title: cleanTitle(m.title),
             source: 'webseries',
-            year: m.year === 'Series' ? '2026' : m.year // Default to current if ambiguous
+            year: (m.year === 'Series' || m.year === 'Web Series') ? '2026' : m.year // Default to current if ambiguous
         })).slice(0, 20);
 
-        // AWAIT enrichment to ensure posters are sent to client
+        // AWAIT enrichment for the first 10, do rest in background to ensure fast response but eventual completeness
+        const toEnrich = limitedResults.slice(0, 10);
+        const remaining = limitedResults.slice(10);
+
         if (limitedResults.length > 0) {
-            logger.info(`Enriching ${limitedResults.length} web series with details...`);
-            await Promise.all(limitedResults.map(async (movie) => {
+            logger.info(`Enriching ${toEnrich.length} web series immediately...`);
+            await Promise.all(toEnrich.map(async (movie) => {
                 try {
-                    // Only fetch if poster is missing
                     if (!movie.poster_url && !movie.posterUrl) {
                         const details = await getMovieDetails(movie.url);
-                        if (details) {
-                            Object.assign(movie, details);
-                        }
+                        if (details) Object.assign(movie, details);
                     }
                 } catch (err) {
                     logger.warn(`Failed to enrich series ${movie.title}: ${err.message}`);
                 }
             }));
 
-            // Cache in background
-            insertMovies(limitedResults).catch(() => { });
+            // Background enrichment for the rest
+            remaining.forEach(async (movie) => {
+                try {
+                    if (!movie.poster_url && !movie.posterUrl) {
+                        const details = await getMovieDetails(movie.url);
+                        if (details) await insertMovie({ ...movie, ...details });
+                    }
+                } catch (err) { }
+            });
+
+            // Cache immediately enriched results
+            insertMovies(toEnrich).catch(() => { });
         }
 
         logger.info(`Found ${limitedResults.length} web series entries`);
@@ -1045,7 +1155,10 @@ async function searchIsaidubSpecific(query) {
     $('.f a').each((_, el) => {
         const text = $(el).text();
         const href = $(el).attr('href');
-        if (targetYears.some(y => text.includes(y)) || fuzzyMatch(text, query)) {
+        // Strictly Tamil only
+        const isTamil = text.toLowerCase().includes('tamil') || href?.toLowerCase().includes('tamil');
+
+        if (isTamil && (targetYears.some(y => text.includes(y)) || fuzzyMatch(text, query))) {
             matchingCategories.push({
                 url: href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`,
                 year: text.match(/\d{4}/)?.[0] || 'Dubbed'
@@ -1056,6 +1169,7 @@ async function searchIsaidubSpecific(query) {
     // Limit to 2 most relevant categories to keep search fast
     for (const cat of matchingCategories.slice(0, 2)) {
         const movies = await scrapeAllPages(cat.url, 1, cat.year);
+        // Ensure only Tamil results are merged
         results.push(...movies.map(m => ({ ...m, source: 'isaidub' })));
     }
 
@@ -1075,17 +1189,21 @@ async function searchWebSeriesSpecific(query) {
     $('.f a').each((_, el) => {
         const text = $(el).text();
         const href = $(el).attr('href');
-        if (fuzzyMatch(text, query) || text.includes('2025') || text.includes('2024') || text.includes('2023')) {
+
+        const isYearMatch = /202[3-7]/.test(text);
+        const isTamilSeries = text.toLowerCase().includes('tamil') && text.toLowerCase().includes('series');
+
+        if (isYearMatch || isTamilSeries || (query && fuzzyMatch(text, query))) {
             matchingFolders.push({
                 url: href.startsWith('http') ? href : `${BASE_URL}${href}`,
-                year: 'Web Series'
+                year: text.match(/\d{4}/)?.[0] || 'Web Series'
             });
         }
     });
 
     // Increase range to get more results (User requested > 10)
     for (const folder of matchingFolders.slice(0, 6)) {
-        const items = await scrapeAllPages(folder.url, 1, 'Series');
+        const items = await scrapeAllPages(folder.url, 1, folder.year);
         results.push(...items.map(m => ({ ...m, source: 'webseries' })));
     }
 

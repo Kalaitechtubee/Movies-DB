@@ -6,22 +6,27 @@
 import express from 'express';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { mcpServer } from '../mcp/server.js';
+import axios from 'axios';
 import { searchMovies, getStats, getAllMovies, insertMovie, insertMovies } from '../services/database.js';
-import { scrapeHome, searchMoviesDirect, searchAllDirect, getMovieDownloadLinks, getCategories, getCategoryMovies, getIsaidubLatest, getMovieDetails, getLatestUpdates, getTeluguLatest, getWebSeriesLatest } from '../services/scraper.js';
+import { scrapeHome, searchMoviesDirect, searchAllDirect, getMovieDownloadLinks, getCategories, getCategoryMovies, getIsaidubLatest, getMovieDetails, getLatestUpdates, getWebSeriesLatest } from '../services/scraper.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
 
+
+
 /**
- * Get Latest Telugu Movies Endpoint
+ * Get Movie Details (Resolutions/Direct Links) Endpoint
  */
-router.get('/api/movies/telugu', async (req, res) => {
+router.get('/api/movies/details', async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: 'Missing url' });
     try {
-        const results = await getTeluguLatest();
-        res.json(results);
+        const details = await getMovieDownloadLinks(url);
+        res.json(details);
     } catch (error) {
-        logger.error('Telugu movies error:', error.message);
-        res.status(500).json({ error: 'Failed' });
+        logger.error(`Details error for ${url}:`, error.message);
+        res.status(500).json({ error: 'Failed to fetch details' });
     }
 });
 
@@ -111,9 +116,9 @@ router.get('/api/search', async (req, res) => {
             source = 'direct';
         }
 
-        // Limit enrichment to first 10 for performance, do rest in background
-        const toEnrich = results.slice(0, 10);
-        const remaining = results.slice(10);
+        // Limit enrichment to first 20 for performance, do rest in background
+        const toEnrich = results.slice(0, 20);
+        const remaining = results.slice(20);
 
         const detailedResults = await Promise.all(toEnrich.map(async (movie) => {
             try {
@@ -286,8 +291,8 @@ router.get('/api/movies/latest', async (req, res) => {
 
         // Enrichment for missing posters in latest movies (crucial for homepage)
         // Split into "immediate" (await) and "background" to avoid slow page load
-        const toEnrichImmediate = results.slice(0, 6);
-        const remaining = results.slice(6);
+        const toEnrichImmediate = results.slice(0, 20);
+        const remaining = results.slice(20);
 
         const enrichedImmediate = await Promise.all(toEnrichImmediate.map(async (movie) => {
             if (!movie.poster_url) {
@@ -348,6 +353,36 @@ router.get('/api/movies/isaidub', async (req, res) => {
     } catch (error) {
         logger.error('Isaidub latest movies error:', error.message);
         res.status(500).json({ error: 'Failed to fetch isaidub latest movies' });
+    }
+});
+
+/**
+ * Image Proxy Endpoint - Bypasses CORS and Hotlinking restrictions
+ */
+router.get('/api/proxy-image', async (req, res) => {
+    const imageUrl = req.query.url;
+    if (!imageUrl) return res.status(400).send('Missing url');
+
+    try {
+        const response = await axios({
+            method: 'get',
+            url: imageUrl,
+            responseType: 'stream',
+            headers: {
+                'Referer': 'https://moviesda15.com/', // Bypasses hotlink protection
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+            },
+            timeout: 5000
+        });
+
+        // Set headers and pipe data
+        res.set('Content-Type', response.headers['content-type']);
+        res.set('Cache-Control', 'public, max-age=86400');
+        res.set('Access-Control-Allow-Origin', '*');
+        response.data.pipe(res);
+    } catch (error) {
+        logger.error(`Proxy image error for ${imageUrl}: ${error.message}`);
+        res.status(500).send('Failed to fetch image');
     }
 });
 
