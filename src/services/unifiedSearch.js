@@ -26,8 +26,12 @@ export async function performUnifiedSearch(query) {
     logger.info(`Starting deterministic unified search for: ${query}`);
 
     try {
-        // 1. Fetch metadata from TMDB first (Deterministic Selection)
-        const tmdbMetadata = await searchTMDBMovie(query);
+        // 1. Search TMDB first (Metadata Authority)
+        const isSeries = query.toLowerCase().includes('season') ||
+            query.toLowerCase().includes('web series') ||
+            query.toLowerCase().includes('episode');
+
+        const tmdbMetadata = await searchTMDBMovie(query, 'Unknown', isSeries ? 'series' : 'movie');
 
         // 2. Normalize title and year for Moviesda search
         const searchTitle = tmdbMetadata ? tmdbMetadata.title : query;
@@ -44,6 +48,7 @@ export async function performUnifiedSearch(query) {
                 movie: {
                     title: cached.title,
                     year: cached.year,
+                    url: cached.url || '',
                     rating: cached.rating,
                     poster: cached.poster_url,
                     backdrop: cached.backdrop_url,
@@ -86,7 +91,6 @@ export async function performUnifiedSearch(query) {
                 const fullDetails = await getMovieDownloadLinks(bestMatch.url, query);
                 if (fullDetails) {
                     bestMatch = { ...bestMatch, ...fullDetails };
-                    await insertMovie(bestMatch);
                 }
             }
 
@@ -102,11 +106,15 @@ export async function performUnifiedSearch(query) {
             if (tmdbHasPoster) {
                 finalPoster = tmdbMetadata.poster;
                 posterFrom = 'tmdb';
-            } else if (bestMatch?.poster_url) {
-                finalPoster = bestMatch.poster_url;
-                posterFrom = 'moviesda';
             } else {
-                posterFrom = 'placeholder';
+                // FALLBACK: Try to get poster from Moviesda if TMDB failed
+                const moviesdaPoster = bestMatch?.poster_url || (bestMatch?.url ? await getQuickPoster(bestMatch.url) : null);
+                if (moviesdaPoster) {
+                    finalPoster = moviesdaPoster;
+                    posterFrom = 'moviesda';
+                } else {
+                    posterFrom = 'placeholder';
+                }
             }
 
             // Determine overview source (priority: TMDB > Moviesda > Placeholder)
@@ -199,7 +207,7 @@ export async function performUnifiedSearch(query) {
  * 1️⃣ TMDB (if poster + overview available with length > 30)
  * 2️⃣ Moviesda (only if TMDB missing/incomplete)
  * 3️⃣ Placeholder (last fallback)
- * 
+ *
  * @param {Object} movie - Movie object to enrich
  * @returns {Promise<Object>} Enriched movie
  */
@@ -207,11 +215,17 @@ export async function enrichMovie(movie) {
     if (!movie) return null;
 
     try {
-        // Fetch TMDB metadata
-        const tmdb = await searchTMDBMovie(movie.title, movie.year);
+        // 1. Determine if this is a series
+        const isSeries = movie.type === 'series' ||
+            movie.url.includes('web-series') ||
+            movie.title.toLowerCase().includes('season') ||
+            movie.title.toLowerCase().includes('episode');
+
+        // 2. Fetch TMDB metadata (passing series type)
+        const tmdb = await searchTMDBMovie(movie.title, movie.year, isSeries ? 'series' : 'movie');
 
         // 🔍 DEBUG LOGGING
-        logger.debug(`[ENRICH] "${movie.title}" (${movie.year || 'no year'})`);
+        logger.debug(`[ENRICH] "${movie.title}" (${movie.year || 'no year'}) - Series: ${isSeries}`);
         if (tmdb) {
             logger.debug(`  → TMDB: poster=${!!tmdb.poster}, overview=${tmdb.overview?.length || 0} chars`);
         } else {
@@ -219,34 +233,35 @@ export async function enrichMovie(movie) {
         }
 
         // ✅ SMART HYBRID VALIDATION - Pick best source for EACH field independently
-        // TMDB has poster?
         const tmdbHasPoster = tmdb && tmdb.poster;
-        // TMDB has valid overview (>30 chars)?
         const tmdbHasOverview = tmdb && tmdb.overview && tmdb.overview.trim().length > 30;
-        // TMDB is fully valid (complete metadata)?
-        const hasFullTMDB = tmdbHasPoster && tmdbHasOverview;
 
-        // Determine poster source (priority: TMDB > Moviesda > placeholder)
+        // Decision logic: Pick best poster
         let finalPoster = null;
         let posterSource = 'none';
 
         if (tmdbHasPoster) {
             finalPoster = tmdb.poster;
             posterSource = 'tmdb';
-        } else if (movie.poster_url && !movie.poster_url.includes('folder')) {
-            finalPoster = movie.poster_url;
-            posterSource = 'moviesda';
         } else {
-            const quickPoster = await getQuickPoster(movie.url);
-            if (quickPoster) {
-                finalPoster = quickPoster;
+            // FALLBACK: Try existing movie poster, then scrape if missing
+            const existingPoster = movie.poster_url || movie.poster;
+            if (existingPoster && !existingPoster.includes('placeholder') && !existingPoster.includes('folder')) {
+                finalPoster = existingPoster;
                 posterSource = 'moviesda';
             } else {
-                posterSource = 'placeholder';
+                const scrapedPoster = await getQuickPoster(movie.url);
+                if (scrapedPoster) {
+                    finalPoster = scrapedPoster;
+                    posterSource = 'moviesda';
+                } else {
+                    finalPoster = null;
+                    posterSource = 'placeholder';
+                }
             }
         }
 
-        // Determine overview source (priority: TMDB > Moviesda > placeholder)
+        // Determine overview source (priority: TMDB > Moviesda > Placeholder)
         let finalOverview = null;
         let overviewSource = 'none';
 
@@ -256,14 +271,16 @@ export async function enrichMovie(movie) {
         } else if (movie.synopsis || movie.description) {
             finalOverview = movie.synopsis || movie.description;
             overviewSource = 'moviesda';
+        } else if (tmdb?.overview) {
+            finalOverview = tmdb.overview;
+            overviewSource = 'tmdb';
         } else {
             finalOverview = 'Description not available.';
             overviewSource = 'placeholder';
         }
 
-        // Final source is determined by which field(s) came from TMDB
-        const metadataSource = tmdbHasPoster ? 'tmdb' :
-            (posterSource === 'moviesda' ? 'moviesda' : 'placeholder');
+        // Final source is determined by poster source (primary badge)
+        const metadataSource = posterSource;
 
         logger.debug(`  → Result: poster=${posterSource}, overview=${overviewSource}, source=${metadataSource}`);
 
@@ -285,9 +302,8 @@ export async function enrichMovie(movie) {
             synopsis: finalOverview,
             genres: genreNames || movie.genres || movie.genre || '',
             cast: tmdb?.cast || movie.cast || movie.starring,
-            director: tmdb?.director || movie.director,
             tmdb_id: tmdb?.tmdb_id || null,
-            source: metadataSource === 'tmdb' ? 'tmdb-enriched' : 'moviesda-fallback',
+            source: tmdbHasPoster ? 'tmdb-enriched' : 'moviesda-fallback',
             // Explicit source tracking for debugging and Flutter
             metadata: {
                 poster_from: posterSource,

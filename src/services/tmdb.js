@@ -36,21 +36,28 @@ function selectPrimaryTMDBMovie(results, preferredYear) {
 }
 
 /**
- * Search for a movie on TMDB
- * @param {string} query - Movie title to search for
+ * Search for a movie or TV show on TMDB
+ * @param {string} query - Title to search for
  * @param {string} year - Optional release year
- * @returns {Promise<Object|null>} Movie metadata or null if not found
+ * @param {string} type - 'movie' or 'series'
+ * @returns {Promise<Object|null>} Metadata or null if not found
  */
-export async function searchTMDBMovie(query, year = '') {
+export async function searchTMDBMovie(query, year = '', type = 'movie') {
     if (!TMDB_API_KEY) {
         logger.warn('TMDB_API_KEY is not defined in environment');
         return null;
     }
 
-    // Clean query (remove technical noise)
+    // ✅ NORMALIZE TITLE - Remove (Season 01), Web Series, Tamil, etc. 
+    // This allows matching "Freedom at Midnight (Season 02)" to "Freedom at Midnight"
     const cleanQuery = query
         .replace(/\d{4}/g, '')
-        .replace(/Tamil\s*Movie/gi, '')
+        .replace(/\(.*?\)/g, '')            // remove (Season 01)
+        .replace(/Season\s*\d+/gi, '')      // remove Season 01
+        .replace(/Web\s*Series/gi, '')      // remove Web Series
+        .replace(/Series/gi, '')
+        .replace(/Web/gi, '')
+        .replace(/Tamil/gi, '')
         .replace(/Original/gi, '')
         .replace(/Single\s*Part/gi, '')
         .replace(/\[.*\]/g, '')
@@ -62,11 +69,21 @@ export async function searchTMDBMovie(query, year = '') {
         .replace(/\s+/g, ' ')
         .trim();
 
+    logger.debug(`TMDB normalized query: "${cleanQuery}" (Type: ${type})`);
+
     try {
+        const endpoint = type === 'series' ? 'tv' : 'movie';
+
         const search = async (lang, useYear = true) => {
-            let url = `${BASE_URL}/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(cleanQuery)}&language=${lang}&include_adult=false`;
+            let url = `${BASE_URL}/search/${endpoint}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(cleanQuery)}&language=${lang}&include_adult=false`;
+
+            // For TV shows, the param is 'first_air_date_year' instead of 'year'
             if (useYear && year && year !== 'Unknown' && /^\d{4}$/.test(year)) {
-                url += `&year=${year}`;
+                if (type === 'series') {
+                    url += `&first_air_date_year=${year}`;
+                } else {
+                    url += `&year=${year}`;
+                }
             }
             logger.debug(`TMDB Search URL (${lang}${useYear ? ' w/ year' : ''}): ${url}`);
             return axios.get(url);
@@ -93,21 +110,29 @@ export async function searchTMDBMovie(query, year = '') {
             }
         }
 
-        const movie = selectPrimaryTMDBMovie(results, year);
+        if (!results || results.length === 0) return null;
 
-        if (movie) {
+        // selection logic for both Movie and TV fields
+        const selected = selectPrimaryTMDBMovie(results, year);
+
+        if (selected) {
+            // Field mapping (TV uses 'name' and 'first_air_date', Movie uses 'title' and 'release_date')
+            const title = selected.name || selected.title;
+            const releaseDate = selected.first_air_date || selected.release_date;
+
             return {
-                tmdb_id: movie.id,
-                title: movie.title,
-                original_title: movie.original_title,
-                year: movie.release_date ? movie.release_date.split('-')[0] : 'Unknown',
-                rating: movie.vote_average ? movie.vote_average.toFixed(1) : '0',
-                poster: movie.poster_path ? `https://image.tmdb.org/t/p/w500${movie.poster_path}` : null,
-                backdrop: movie.backdrop_path ? `https://image.tmdb.org/t/p/original${movie.backdrop_path}` : null,
-                overview: movie.overview,
-                genres: movie.genre_ids,
-                popularity: movie.popularity,
-                vote_count: movie.vote_count
+                tmdb_id: selected.id,
+                title: title,
+                original_title: selected.original_name || selected.original_title,
+                year: releaseDate ? releaseDate.split('-')[0] : 'Unknown',
+                rating: selected.vote_average ? selected.vote_average.toFixed(1) : '0',
+                poster: selected.poster_path ? `https://image.tmdb.org/t/p/w500${selected.poster_path}` : null,
+                backdrop: selected.backdrop_path ? `https://image.tmdb.org/t/p/original${selected.backdrop_path}` : null,
+                overview: selected.overview,
+                genres: selected.genre_ids,
+                popularity: selected.popularity,
+                vote_count: selected.vote_count,
+                type: type
             };
         }
 
