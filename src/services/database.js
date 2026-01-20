@@ -7,6 +7,7 @@ import supabase from '../utils/supabase.js';
 import logger from '../utils/logger.js';
 
 const TABLE_NAME = 'movies';
+const UNIFIED_TABLE_NAME = 'unified_movies';
 
 /**
  * Initialize database - creates table if not exists
@@ -65,6 +66,21 @@ CREATE TABLE IF NOT EXISTS movies (
 
 CREATE INDEX IF NOT EXISTS idx_movies_title ON movies USING gin(to_tsvector('english', title));
 CREATE INDEX IF NOT EXISTS idx_movies_year ON movies(year);
+
+-- Unified Movies Table
+CREATE TABLE IF NOT EXISTS unified_movies (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    year TEXT,
+    rating TEXT,
+    poster_url TEXT,
+    backdrop_url TEXT,
+    overview TEXT,
+    details JSONB,
+    downloads JSONB,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(title, year)
+);
     `.trim();
 }
 
@@ -102,6 +118,68 @@ export async function insertMovie(movie) {
         }
     } catch (err) {
         logger.error('Failed to insert movie:', err.message);
+    }
+}
+
+/**
+ * Get unified movie from cache
+ * @param {string} title - Movie title
+ * @param {string} year - Release year
+ */
+export async function getUnifiedMovie(title, year) {
+    if (!supabase) return null;
+    try {
+        const { data, error } = await supabase
+            .from(UNIFIED_TABLE_NAME)
+            .select('*')
+            .eq('title', title)
+            .eq('year', year || 'Unknown')
+            .single();
+
+        if (error && error.code !== 'PGRST116') {
+            logger.error('Get unified movie error:', error.message);
+            return null;
+        }
+
+        return data;
+    } catch (err) {
+        logger.error('Failed to get unified movie:', err.message);
+        return null;
+    }
+}
+
+/**
+ * Insert/Update unified movie cache
+ * @param {Object} movie - Unified movie object
+ */
+export async function insertUnifiedMovie(movie) {
+    if (!supabase) return;
+    try {
+        const { error } = await supabase
+            .from(UNIFIED_TABLE_NAME)
+            .upsert(
+                {
+                    title: movie.title,
+                    year: movie.year || 'Unknown',
+                    rating: movie.rating || null,
+                    poster_url: movie.poster || null,
+                    backdrop_url: movie.backdrop || null,
+                    overview: movie.overview || null,
+                    details: movie.details || {},
+                    downloads: movie.downloads || [],
+                    updated_at: new Date().toISOString()
+                },
+                {
+                    onConflict: 'title,year',
+                    ignoreDuplicates: false
+                }
+            );
+
+        if (error) {
+            logger.error('Insert unified movie error:', error.message);
+        }
+    } catch (err) {
+        logger.error('Failed to insert unified movie:', err.message);
     }
 }
 

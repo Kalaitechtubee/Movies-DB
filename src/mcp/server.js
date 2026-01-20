@@ -10,6 +10,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { initDb, searchMovies } from '../services/database.js';
 import { searchMoviesDirect, getMovieDownloadLinks, scrapeHome } from '../services/scraper.js';
+import { performUnifiedSearch } from '../services/unifiedSearch.js';
 import logger from '../utils/logger.js';
 
 // Initialize database
@@ -65,6 +66,20 @@ const TOOLS = [
             type: 'object',
             properties: {}
         }
+    },
+    {
+        name: 'unified_movie_search',
+        description: 'Comprehensive unified search combining official metadata and download links. Recommended for end users.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                query: {
+                    type: 'string',
+                    description: 'The movie name (and optionally year) to search for'
+                }
+            },
+            required: ['query']
+        }
     }
 ];
 
@@ -87,6 +102,9 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             case 'refresh_database':
                 return await handleRefreshDatabase();
+
+            case 'unified_movie_search':
+                return await handleUnifiedMovieSearch(args);
 
             default:
                 throw new Error(`Unknown tool: ${name}`);
@@ -199,6 +217,62 @@ async function handleRefreshDatabase() {
             text: 'Database refresh started in background.'
         }]
     };
+}
+
+/**
+ * Handle unified_movie_search tool
+ */
+async function handleUnifiedMovieSearch(args) {
+    const { query } = args;
+
+    if (!query || typeof query !== 'string') {
+        throw new Error('Invalid query: must be a non-empty string');
+    }
+
+    const result = await performUnifiedSearch(query);
+
+    if (!result.found) {
+        return {
+            content: [{
+                type: 'text',
+                text: `No unified results found for "${query}".`
+            }]
+        };
+    }
+
+    const { movie } = result;
+    let text = `🎬 **${movie.title} (${movie.year})**\n`;
+    if (movie.rating) text += `⭐ Rating: ${movie.rating}/10\n`;
+    if (movie.details?.director) text += `🎥 Director: ${movie.details.director}\n`;
+    text += `\n📝 **Overview:**\n${movie.overview || 'No overview available.'}\n\n`;
+
+    if (movie.downloads && movie.downloads.length > 0) {
+        text += `⬇️ **Download/Watch Links (Moviesda):**\n`;
+        movie.downloads.forEach(dl => {
+            text += `\n• **${dl.quality}** (${dl.size})\n`;
+            if (dl.direct_link) text += `  ⚡ [Fast Download](${dl.direct_link})\n`;
+            if (dl.watch_link) text += `  🎬 [Watch Online](${dl.watch_link})\n`;
+            if (dl.link) text += `  🔗 [Download Page](${dl.link})\n`;
+        });
+    } else {
+        text += '\n⚠️ No direct download links found on Moviesda for this title.';
+    }
+
+    const images = [];
+    if (movie.poster) images.push(movie.poster);
+    if (movie.backdrop) images.push(movie.backdrop);
+
+    const content = [{ type: 'text', text }];
+
+    // Add images if any
+    images.forEach(img => {
+        content.push({
+            type: 'text',
+            text: `Image: ${img}` // MCP clients might handle this as rich text or we could use image type if supported
+        });
+    });
+
+    return { content };
 }
 
 export { mcpServer };

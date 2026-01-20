@@ -8,7 +8,8 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { mcpServer } from '../mcp/server.js';
 import axios from 'axios';
 import { searchMovies, getStats, getAllMovies, insertMovie, insertMovies } from '../services/database.js';
-import { scrapeHome, searchMoviesDirect, searchAllDirect, getMovieDownloadLinks, getCategories, getCategoryMovies, getIsaidubLatest, getMovieDetails, getLatestUpdates, getWebSeriesLatest } from '../services/scraper.js';
+import { scrapeHome, searchMoviesDirect, searchAllDirect, getMovieDownloadLinks, getCategories, getCategoryMovies, getIsaidubLatest, getLatestUpdates, getWebSeriesLatest } from '../services/scraper.js';
+import { performUnifiedSearch, enrichMovieList, enrichMovie } from '../services/unifiedSearch.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
@@ -22,8 +23,14 @@ router.get('/api/movies/details', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: 'Missing url' });
     try {
+        // 1. Get technical links from scraper
         const details = await getMovieDownloadLinks(url);
-        res.json(details);
+        if (!details) return res.status(404).json({ error: 'Movie not found' });
+
+        // 2. Enrich scraper results with rich TMDB metadata
+        const enriched = await enrichMovie(details);
+
+        res.json(enriched);
     } catch (error) {
         logger.error(`Details error for ${url}:`, error.message);
         res.status(500).json({ error: 'Failed to fetch details' });
@@ -36,7 +43,8 @@ router.get('/api/movies/details', async (req, res) => {
 router.get('/api/movies/webseries', async (req, res) => {
     try {
         const results = await getWebSeriesLatest();
-        res.json(results);
+        const enriched = await enrichMovieList(results);
+        res.json(enriched);
     } catch (error) {
         logger.error('WebSeries error:', error.message);
         res.status(500).json({ error: 'Failed' });
@@ -97,69 +105,43 @@ router.post('/messages', async (req, res) => {
 });
 
 /**
- * REST Search Endpoint
+ * REST Search Endpoint (Unified)
  */
 router.get('/api/search', async (req, res) => {
     const query = req.query.q;
-
-    if (!query) {
-        return res.status(400).json({ error: 'Missing query parameter: q' });
-    }
+    if (!query) return res.status(400).json({ error: 'Missing query' });
 
     try {
-        let results = await searchMovies(query);
-        let source = 'database';
-
-        if (results.length === 0) {
-            logger.info(`No DB results for "${query}", performing comprehensive direct search...`);
-            results = await searchAllDirect(query);
-            source = 'direct';
-        }
-
-        // Limit enrichment to first 20 for performance, do rest in background
-        const toEnrich = results.slice(0, 20);
-        const remaining = results.slice(20);
-
-        const detailedResults = await Promise.all(toEnrich.map(async (movie) => {
-            try {
-                // If poster is missing or it's a direct link/missing resolutions, fetch them
-                if (!movie.poster_url || !movie.resolutions || movie.resolutions.length === 0) {
-                    const details = await getMovieDownloadLinks(movie.url, query);
-                    return details ? { ...movie, ...details } : movie;
-                }
-            } catch (err) {
-                logger.warn(`Failed to enrich movie details for ${movie.title}: ${err.message}`);
-            }
-            return movie;
-        }));
-
-        // Background enrichment for the rest
-        if (remaining.length > 0) {
-            remaining.forEach(async (movie) => {
-                try {
-                    if (!movie.poster_url || !movie.resolutions || movie.resolutions.length === 0) {
-                        const details = await getMovieDownloadLinks(movie.url, query);
-                        if (details) await insertMovie({ ...movie, ...details });
-                    }
-                } catch (err) { /* ignore */ }
+        const result = await performUnifiedSearch(query);
+        // Map to old search structure for compatibility or return unified
+        if (result.found) {
+            res.json({
+                count: 1,
+                source: result.source.links,
+                results: [result.movie]
             });
+        } else {
+            res.json({ count: 0, results: [] });
         }
-
-        const finalResults = [...detailedResults, ...remaining];
-
-        // Persist enriched results to database
-        if (detailedResults.length > 0) {
-            await insertMovies(detailedResults);
-        }
-
-        res.json({
-            count: finalResults.length,
-            source,
-            results: finalResults
-        });
     } catch (error) {
-        logger.error(`Search error for query "${query}":`, error);
-        res.status(500).json({ error: 'Search failed', details: error.message });
+        logger.error(`Search error for query "${query}":`, error.message);
+        res.status(500).json({ error: 'Search failed' });
+    }
+});
+
+/**
+ * Unified Search Endpoint
+ */
+router.get('/api/unified-search', async (req, res) => {
+    const query = req.query.q;
+    if (!query) return res.status(400).json({ error: 'Missing query' });
+
+    try {
+        const result = await performUnifiedSearch(query);
+        res.json(result);
+    } catch (error) {
+        logger.error(`Unified search API error for "${query}":`, error.message);
+        res.status(500).json({ error: 'Unified search failed' });
     }
 });
 
@@ -232,14 +214,15 @@ router.get('/api/movies/category', async (req, res) => {
     }
 
     try {
-        const results = await getCategoryMovies(url, year, enrich);
+        const results = await getCategoryMovies(url, year, false);
+        const enriched = await enrichMovieList(results);
         res.json({
-            count: results.length,
-            results
+            count: enriched.length,
+            results: enriched
         });
     } catch (error) {
         logger.error('Category movies error:', error.message);
-        res.status(500).json({ error: 'Failed to fetch category movies' });
+        res.status(500).json({ error: 'Failed' });
     }
 });
 
@@ -250,29 +233,11 @@ router.get('/api/movies/recent', async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
     try {
         const results = await getAllMovies(limit);
-
-        // Background enrichment for movies missing posters
-        const moviesMissingPosters = results.filter(m => !m.poster_url);
-        if (moviesMissingPosters.length > 0) {
-            // Only process a small batch to not slow down the response
-            const toEnrich = moviesMissingPosters.slice(0, 5);
-            Promise.all(toEnrich.map(async (movie) => {
-                try {
-                    const details = await getMovieDetails(movie.url);
-                    if (details && details.poster_url) {
-                        await insertMovie({ ...movie, ...details });
-                        logger.debug(`Background enriched poster for: ${movie.title}`);
-                    }
-                } catch (err) {
-                    // Ignore background errors
-                }
-            }));
-        }
-
-        res.json(results);
+        const enriched = await enrichMovieList(results);
+        res.json(enriched);
     } catch (error) {
         logger.error('Recent movies error:', error.message);
-        res.status(500).json({ error: 'Failed to fetch recent movies' });
+        res.status(500).json({ error: 'Failed' });
     }
 });
 
@@ -281,46 +246,12 @@ router.get('/api/movies/recent', async (req, res) => {
  */
 router.get('/api/movies/latest', async (req, res) => {
     try {
-        // For "latest", we prioritize live updates from the website
         let results = await getLatestUpdates();
-
         if (!results || results.length === 0) {
-            logger.info('Live updates empty, falling back to database');
             results = await getAllMovies(15);
         }
-
-        // Enrichment for missing posters in latest movies (crucial for homepage)
-        // Split into "immediate" (await) and "background" to avoid slow page load
-        const toEnrichImmediate = results.slice(0, 20);
-        const remaining = results.slice(20);
-
-        const enrichedImmediate = await Promise.all(toEnrichImmediate.map(async (movie) => {
-            if (!movie.poster_url) {
-                try {
-                    const details = await getMovieDetails(movie.url);
-                    if (details) {
-                        const updated = { ...movie, ...details };
-                        await insertMovie(updated); // Cache it
-                        return updated;
-                    }
-                } catch (err) {
-                    logger.debug(`Failed to enrich latest movie ${movie.title}: ${err.message}`);
-                }
-            }
-            return movie;
-        }));
-
-        // Do the rest in background
-        remaining.forEach(async (movie) => {
-            if (!movie.poster_url) {
-                try {
-                    const details = await getMovieDetails(movie.url);
-                    if (details) await insertMovie({ ...movie, ...details });
-                } catch (err) { }
-            }
-        });
-
-        res.json([...enrichedImmediate, ...remaining]);
+        const enriched = await enrichMovieList(results);
+        res.json(enriched);
     } catch (error) {
         logger.error('Latest movies error:', error.message);
         res.status(500).json({ error: 'Failed to fetch latest movies' });
@@ -333,23 +264,8 @@ router.get('/api/movies/latest', async (req, res) => {
 router.get('/api/movies/isaidub', async (req, res) => {
     try {
         const results = await getIsaidubLatest();
-
-        // Enrich the results with posters
-        const enrichedResults = await Promise.all(results.map(async (movie) => {
-            try {
-                const details = await getMovieDetails(movie.url);
-                return details ? { ...movie, ...details } : movie;
-            } catch (err) {
-                return movie;
-            }
-        }));
-
-        // Insert into DB for caching
-        if (enrichedResults.length > 0) {
-            await insertMovies(enrichedResults);
-        }
-
-        res.json(enrichedResults);
+        const enriched = await enrichMovieList(results);
+        res.json(enriched);
     } catch (error) {
         logger.error('Isaidub latest movies error:', error.message);
         res.status(500).json({ error: 'Failed to fetch isaidub latest movies' });
@@ -361,27 +277,42 @@ router.get('/api/movies/isaidub', async (req, res) => {
  */
 router.get('/api/proxy-image', async (req, res) => {
     const imageUrl = req.query.url;
-    if (!imageUrl) return res.status(400).send('Missing url');
+    if (!imageUrl || imageUrl === 'null' || imageUrl === 'undefined' || imageUrl === '') {
+        return res.status(400).send('Missing url');
+    }
 
     try {
+        const urlObj = new URL(imageUrl);
+        const isMoviesda = urlObj.hostname.includes('moviesda') || urlObj.hostname.includes('isaidub');
+
         const response = await axios({
             method: 'get',
             url: imageUrl,
             responseType: 'stream',
             headers: {
-                'Referer': 'https://moviesda15.com/', // Bypasses hotlink protection
+                'Referer': isMoviesda ? `${urlObj.origin}/` : 'https://www.google.com/',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
             },
-            timeout: 5000
+            timeout: 10000,
+            validateStatus: (status) => status < 400
         });
 
         // Set headers and pipe data
-        res.set('Content-Type', response.headers['content-type']);
+        if (response.headers['content-type']) {
+            res.set('Content-Type', response.headers['content-type']);
+        }
         res.set('Cache-Control', 'public, max-age=86400');
         res.set('Access-Control-Allow-Origin', '*');
         response.data.pipe(res);
     } catch (error) {
         logger.error(`Proxy image error for ${imageUrl}: ${error.message}`);
+
+        // Fallback for TMDB images: Redirect directly if proxy fails
+        if (imageUrl.includes('tmdb.org') || imageUrl.includes('cloudinary')) {
+            res.set('Access-Control-Allow-Origin', '*');
+            return res.redirect(imageUrl);
+        }
+
         res.status(500).send('Failed to fetch image');
     }
 });

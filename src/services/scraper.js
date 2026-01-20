@@ -306,96 +306,40 @@ async function scrapeAllPages(baseUrl, maxPages, year = 'Unknown') {
 }
 
 /**
- * Extract detailed info for a single movie
+ * Extract just the poster URL from a movie page (Quick fallback)
  * @param {string} url - Movie URL
- * @returns {Promise<Object>} Detailed movie info
+ * @returns {Promise<string|null>} Poster URL
  */
-export async function getMovieDetails(url) {
-    const $ = await fetchPage(url);
-    if (!$) return null;
+export async function getQuickPoster(url) {
+    try {
+        const $ = await fetchPage(url);
+        if (!$) return null;
 
-    const details = {
-        poster_url: $('meta[property="og:image"]').attr('content') ||
+        let poster = $('meta[property="og:image"]').attr('content') ||
+            $('meta[name="twitter:image"]').attr('content') ||
             $('link[rel="image_src"]').attr('href') ||
             $('.movie-info-container source[type="image/webp"]').first().attr('srcset')?.split(' ')[0] ||
             $('.movie-info-container img').first().attr('src') ||
             $('.header-poster img').first().attr('src') ||
-            $('.f img').filter((i, el) => !$(el).attr('src')?.includes('folder') && !$(el).attr('src')?.includes('loader')).first().attr('src') ||
-            null,
-        director: '',
-        starring: '',
-        genres: '',
-        quality: 'Original HD',
-        language: 'Tamil',
-        rating: '',
-        lastUpdated: '',
-        synopsis: '',
-    };
+            $('center img').first().attr('src') ||
+            $('.f img').first().attr('src');
 
-    if (details.poster_url && !details.poster_url.startsWith('http')) {
-        const urlObj = new URL(url);
-        details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
-    }
-
-    $('.movie-info li, .isai .pro b').each((_, el) => {
-        let label, value;
-        if ($(el).is('li')) {
-            label = $(el).find('strong').text().replace(':', '').trim();
-            value = $(el).find('span').text().trim();
-        } else {
-            label = $(el).text().replace(':', '').trim();
-            value = $(el).next().next('font').text().trim() || $(el).next().next().text().trim();
-        }
-
-        if (!label || !value) return;
-
-        const lowerLabel = label.toLowerCase();
-        if (lowerLabel.includes('director')) details.director = value;
-        else if (lowerLabel.includes('starring') || lowerLabel.includes('cast')) details.starring = value;
-        else if (lowerLabel.includes('genres') || lowerLabel.includes('category')) details.genres = value;
-        else if (lowerLabel.includes('quality')) details.quality = value;
-        else if (lowerLabel.includes('language')) details.language = value;
-        else if (lowerLabel.includes('rating')) details.rating = value;
-        else if (lowerLabel.includes('last updated') || lowerLabel.includes('release')) details.lastUpdated = value;
-    });
-
-    details.synopsis = $('.movie-synopsis').text().replace('Synopsis:', '').trim() ||
-        $('.isai-panel.isai-note p').text().replace('Story/Plot:', '').trim() ||
-        $('.description').text().trim();
-
-    // Fallback: If no metadata found, try to look for any image that looks like a poster
-    if (!details.poster_url) {
-        // Try to find images that are medium sized and not small icons
-        $('img').each((_, img) => {
-            const src = $(img).attr('src');
-            if (src && !src.includes('folder') && !src.includes('loader') && !src.includes('icon')) {
-                const lowerSrc = src.toLowerCase();
-                const isPosterPattern = lowerSrc.includes('poster') || lowerSrc.includes('thumb') ||
-                    lowerSrc.includes('series') || lowerSrc.includes('season');
-                const isImageExt = lowerSrc.endsWith('.webp') || lowerSrc.endsWith('.jpg') ||
-                    lowerSrc.endsWith('.jpeg') || lowerSrc.endsWith('.png');
-
-                if (isPosterPattern || isImageExt) {
-                    details.poster_url = src;
-                    return false; // break
-                }
-            }
-        });
-    }
-
-    // Final cleanup for poster URL - ensure it's an absolute URL
-    if (details.poster_url && !details.poster_url.startsWith('http')) {
-        try {
+        if (poster && !poster.startsWith('http')) {
             const urlObj = new URL(url);
-            details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
-        } catch (e) {
-            // If URL parsing fails, fallback to BASE_URL
-            details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
+            poster = `${urlObj.origin}${poster.startsWith('/') ? '' : '/'}${poster}`;
         }
-    }
 
-    return details;
+        // Filter out specific placeholder icons, but allow valid paths that might contain 'folder'
+        if (poster && (poster.includes('folder.svg') || poster.includes('folder.png') || poster.includes('loader') || poster.includes('icon'))) {
+            return null;
+        }
+
+        return poster;
+    } catch (e) {
+        return null;
+    }
 }
+
 
 /**
  * Search for movies directly on the website
@@ -446,23 +390,14 @@ export async function searchMoviesDirect(query) {
 
     const results = Array.from(uniqueMovies.values()).slice(0, 10); // Limit to 10 for speed
 
-    // 4. Fetch details for each (in parallel)
-    const detailedResults = await Promise.all(results.map(async (movie) => {
-        const details = await getMovieDetails(movie.url);
-        if (details) {
-            return { ...movie, ...details };
-        }
-        return movie;
-    }));
-
     // Cache results in database
-    if (detailedResults.length > 0) {
-        await insertMovies(detailedResults);
-        logger.info(`Cached ${detailedResults.length} movies in database`);
+    if (results.length > 0) {
+        await insertMovies(results);
+        logger.info(`Cached ${results.length} movies in database`);
     }
 
-    logger.info(`Found ${detailedResults.length} detailed results for "${query}"`);
-    return detailedResults;
+    logger.info(`Found ${results.length} results for "${query}"`);
+    return results;
 }
 
 /**
@@ -479,104 +414,14 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
     if (!$) return null;
 
     const details = {
-        title: ($('h1').text() || $('.line').first().text()).trim().replace(/ Tamil Movie$/, ''),
-        poster_url: $('meta[property="og:image"]').attr('content') ||
-            $('link[rel="image_src"]').attr('href') ||
-            $('.movie-info-container source[type="image/webp"]').first().attr('srcset')?.split(' ')[0] ||
-            $('.movie-info-container img').first().attr('src') ||
-            $('.header-poster img').first().attr('src') ||
-            $('.f img').filter((i, el) => !$(el).attr('src')?.includes('folder') && !$(el).attr('src')?.includes('loader')).first().attr('src') ||
-            null,
-        director: '',
-        starring: '',
-        genres: '',
-        quality: 'Original HD',
-        language: 'Tamil',
-        rating: '',
-        lastUpdated: '',
-        synopsis: '',
-        screenshots: [],
+        title: ($('h1').text() || $('.line').first().text() || $('title').text()).trim().replace(/ Tamil Movie$/, ''),
+        url: movieUrl,
         resolutions: []
     };
 
-    if (details.poster_url && !details.poster_url.startsWith('http')) {
-        try {
-            const urlObj = new URL(movieUrl);
-            details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
-        } catch (e) {
-            details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
-        }
-    }
-
-
-    // Parse Detailed Media Info
-    $('.movie-info li, .isai .pro b').each((_, el) => {
-        let label, value;
-        if ($(el).is('li')) {
-            label = $(el).find('strong').text().replace(':', '').trim();
-            value = $(el).find('span').text().trim();
-        } else {
-            label = $(el).text().replace(':', '').trim();
-            value = $(el).next().next('font').text().trim() || $(el).next().next().text().trim();
-        }
-
-        if (!label || !value) return;
-
-        const lowerLabel = label.toLowerCase();
-        if (lowerLabel.includes('director')) details.director = value;
-        else if (lowerLabel.includes('starring') || lowerLabel.includes('cast')) details.starring = value;
-        else if (lowerLabel.includes('genres') || lowerLabel.includes('category')) details.genres = value;
-        else if (lowerLabel.includes('quality')) details.quality = value;
-        else if (lowerLabel.includes('language')) details.language = value;
-        else if (lowerLabel.includes('rating')) details.rating = value;
-        else if (lowerLabel.includes('last updated') || lowerLabel.includes('release')) details.lastUpdated = value;
-    });
-
-    details.synopsis = $('.movie-synopsis').text().replace('Synopsis:', '').trim() ||
-        $('.isai-panel.isai-note p').text().replace('Story/Plot:', '').trim() ||
-        $('.description').text().trim();
-
-    // Fallback: If no metadata found, try to look for any image that looks like a poster
-    if (!details.poster_url) {
-        // Try to find images that are medium sized and not small icons
-        $('img').each((_, img) => {
-            const src = $(img).attr('src');
-            if (src && !src.includes('folder') && !src.includes('loader') && !src.includes('icon')) {
-                const lowerSrc = src.toLowerCase();
-                const isPosterPattern = lowerSrc.includes('poster') || lowerSrc.includes('thumb') ||
-                    lowerSrc.includes('series') || lowerSrc.includes('season');
-                const isImageExt = lowerSrc.endsWith('.webp') || lowerSrc.endsWith('.jpg') ||
-                    lowerSrc.endsWith('.jpeg') || lowerSrc.endsWith('.png');
-
-                if (isPosterPattern || isImageExt) {
-                    details.poster_url = src;
-                    return false; // break
-                }
-            }
-        });
-    }
-
-    // Final cleanup for poster URL - ensure it's an absolute URL
-    if (details.poster_url && !details.poster_url.startsWith('http')) {
-        try {
-            const urlObj = new URL(movieUrl);
-            details.poster_url = `${urlObj.origin}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
-        } catch (e) {
-            details.poster_url = `${BASE_URL}${details.poster_url.startsWith('/') ? '' : '/'}${details.poster_url}`;
-        }
-    }
-
-    // Parse Screenshots
-    $('.screenshot-container img').each((_, el) => {
-        let src = $(el).attr('src');
-        if (src) {
-            if (!src.startsWith('http')) {
-                const urlObj = new URL(movieUrl);
-                src = `${urlObj.origin}${src.startsWith('/') ? '' : '/'}${src}`;
-            }
-            details.screenshots.push(src);
-        }
-    });
+    // Extract basic meta if available on page
+    details.poster_url = await getQuickPoster(movieUrl);
+    details.synopsis = $('.movie-synopsis').text().trim() || $('.line').last().text().trim();
 
     const discoveredFiles = new Map();
     const visited = new Set();
@@ -635,8 +480,8 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
             const linkUrl = link.url;
 
             const isFile = text.match(/\.(mp4|mkv|avi|webm)$/i) || text.includes('Sample');
-            const isEpisode = text.match(/Epi|Episode|Day|Part/i);
-            const isQuality = text.match(/HD|Original|720p|1080p|DVD|HDRip|BDRip|Tamil/i);
+            const isEpisode = text.match(/Epi|Episode|Day|Part/i) || text.match(/[.\s-_]E[Pp]?\d+/i);
+            const isQuality = text.match(/HD|Original|720p|1080p|DVD|HDRip|BDRip|Tamil|480p|360p|240p|640x360|480x320|1280x720|1920x1080/i);
             const hasMovieKeyword = text.match(/Movie|Full|Series|Season/i);
             const isPagination = linkUrl.includes('?page=') || (text.match(/^\d+$/) && depth < 2);
 
@@ -651,8 +496,22 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
 
             if (isFile) {
                 if (!discoveredFiles.has(linkUrl)) {
+                    let finalQuality = currentQuality;
+
+                    // Fallback: Extract quality from filename if current is generic
+                    if (finalQuality === 'Unknown' || finalQuality === 'Episode') {
+                        const qMatch = text.match(/1080p|720p|480p|360p|640x360|480x320|1280x720|1920x1080/i);
+                        if (qMatch) {
+                            const val = qMatch[0].toLowerCase();
+                            if (val.includes('1080')) finalQuality = '1080p';
+                            else if (val.includes('720')) finalQuality = '720p';
+                            else if (val.includes('480')) finalQuality = '480p';
+                            else if (val.includes('360')) finalQuality = '360p';
+                        }
+                    }
+
                     discoveredFiles.set(linkUrl, {
-                        quality: currentQuality,
+                        quality: finalQuality,
                         name: text,
                         url: linkUrl
                     });
@@ -660,7 +519,15 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
             } else if (isPagination || isQuality || isEpisode || hasMovieKeyword || depth < 4) {
                 let nextQuality = currentQuality;
                 if (isQuality && !isEpisode) {
-                    nextQuality = text;
+                    const normalized = text.toLowerCase();
+                    const isOriginal = normalized.includes('original');
+
+                    if (normalized.includes('1080')) nextQuality = isOriginal ? '1080p Original' : '1080p';
+                    else if (normalized.includes('720')) nextQuality = isOriginal ? '720p Original' : '720p';
+                    else if (normalized.includes('480')) nextQuality = isOriginal ? '480p Original' : '480p';
+                    else if (normalized.includes('360')) nextQuality = isOriginal ? '360p Original' : '360p';
+                    else if (normalized.includes('hd')) nextQuality = 'HD';
+                    else nextQuality = text;
                 } else if (isEpisode && currentQuality === 'Unknown') {
                     nextQuality = 'Episode';
                 }
@@ -671,7 +538,7 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
         }
     }
 
-    await explore(movieUrl, details.quality, 0);
+    await explore(movieUrl, 'Unknown', 0);
 
     // Natural sort episodes: Epi 101 should come after Epi 2
     const sortedResolutions = Array.from(discoveredFiles.values()).sort((a, b) => {
@@ -683,7 +550,14 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
 
     details.resolutions = sortedResolutions;
 
-    const CONCURRENCY_LIMIT = 5; // Slightly faster
+    // DECISION: Is this a series?
+    const isSeries = details.resolutions.some(r => r.name.match(/Epi|Episode|Day|Part|Season|S\d+E\d+/i)) ||
+        movieUrl.toLowerCase().includes('web-series') ||
+        details.title.toLowerCase().includes('series');
+
+    details.type = isSeries ? 'series' : 'movie';
+
+    const CONCURRENCY_LIMIT = 5;
     const itemsToProcess = details.resolutions.slice(0, 100);
 
     for (let i = 0; i < itemsToProcess.length; i += CONCURRENCY_LIMIT) {
@@ -703,9 +577,8 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
                 if (!downloadLink) {
                     const subLink = $file('.f a, .folder a, a.coral').filter((_, el) => {
                         const t = $file(el).text().toLowerCase();
-                        return t.includes('.mp4') || t.includes('.mkv') || t.includes('sample');
-                    }).first().attr('href');
-
+                        return t.includes('sample') || t.includes('mp4') || t.includes('mkv');
+                    }).attr('href');
                     if (subLink) {
                         const fullSubUrl = subLink.startsWith('http') ? subLink :
                             subLink.startsWith('/') ? `${BASE_URL}${subLink}` :
@@ -835,37 +708,7 @@ export async function getCategoryMovies(categoryUrl, year = 'Unknown', enrich = 
     // Scrape first page only for quick results, or more if needed
     const movies = await scrapeAllPages(categoryUrl, 1, year);
 
-    if (!enrich) return movies;
-
-    // If enrich is requested, fetch full details for each movie
-    // Use a smaller batch size to avoid overwhelming the server
-    const enrichedMovies = [];
-    const BATCH_SIZE = 3;
-
-    for (let i = 0; i < movies.length; i += BATCH_SIZE) {
-        const batch = movies.slice(i, i + BATCH_SIZE);
-        const results = await Promise.all(batch.map(async (movie) => {
-            try {
-                const details = await getMovieDownloadLinks(movie.url);
-                return details ? { ...movie, ...details } : movie;
-            } catch (err) {
-                logger.warn(`Failed to enrich category movie ${movie.title}: ${err.message}`);
-                return movie;
-            }
-        }));
-        enrichedMovies.push(...results);
-
-        // Break early if we have enough enriched movies for a category view (e.g., 12)
-        if (enrichedMovies.length >= 12) break;
-    }
-
-    // Cache enriched movies if any were found
-    if (enrichedMovies.length > 0) {
-        await insertMovies(enrichedMovies);
-        logger.info(`Cached ${enrichedMovies.length} enriched category movies in database`);
-    }
-
-    return enrichedMovies;
+    return movies;
 }
 
 /**
@@ -886,23 +729,9 @@ export async function scrapeHome() {
 
         // Get the list of movies
         const movies = await scrapeAllPages(item.url, 1, year);
+        await insertMovies(movies);
 
-        // Enrich the first 10 movies with details (posters, director, etc.)
-        const topMovies = movies.slice(0, 10);
-        const enrichedTop = await Promise.all(topMovies.map(async (movie) => {
-            try {
-                const details = await getMovieDownloadLinks(movie.url);
-                return details ? { ...movie, ...details } : movie;
-            } catch (err) {
-                return movie;
-            }
-        }));
-
-        // Combine and insert
-        const finalBatch = [...enrichedTop, ...movies.slice(10)];
-        await insertMovies(finalBatch);
-
-        logger.info(`Scraped ${movies.length} movies from ${item.name} (Enriched ${enrichedTop.length} with posters)`);
+        logger.info(`Scraped ${movies.length} movies from ${item.name}`);
     }
 
     logger.info('Home page scrape completed');
@@ -1070,37 +899,6 @@ export async function getWebSeriesLatest() {
             source: 'webseries',
             year: (m.year === 'Series' || m.year === 'Web Series') ? '2026' : m.year // Default to current if ambiguous
         })).slice(0, 20);
-
-        // AWAIT enrichment for the first 10, do rest in background to ensure fast response but eventual completeness
-        const toEnrich = limitedResults.slice(0, 10);
-        const remaining = limitedResults.slice(10);
-
-        if (limitedResults.length > 0) {
-            logger.info(`Enriching ${toEnrich.length} web series immediately...`);
-            await Promise.all(toEnrich.map(async (movie) => {
-                try {
-                    if (!movie.poster_url && !movie.posterUrl) {
-                        const details = await getMovieDetails(movie.url);
-                        if (details) Object.assign(movie, details);
-                    }
-                } catch (err) {
-                    logger.warn(`Failed to enrich series ${movie.title}: ${err.message}`);
-                }
-            }));
-
-            // Background enrichment for the rest
-            remaining.forEach(async (movie) => {
-                try {
-                    if (!movie.poster_url && !movie.posterUrl) {
-                        const details = await getMovieDetails(movie.url);
-                        if (details) await insertMovie({ ...movie, ...details });
-                    }
-                } catch (err) { }
-            });
-
-            // Cache immediately enriched results
-            insertMovies(toEnrich).catch(() => { });
-        }
 
         logger.info(`Found ${limitedResults.length} web series entries`);
         return limitedResults;
