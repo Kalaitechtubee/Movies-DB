@@ -90,35 +90,76 @@ export async function performUnifiedSearch(query) {
                 }
             }
 
-            // DECISION: Final resolved fields
-            const finalPoster = tmdbMetadata?.poster || (bestMatch?.poster_url || null);
-            const posterFrom = tmdbMetadata?.poster ? 'tmdb' : (bestMatch?.poster_url ? 'moviesda' : 'none');
+            // ✅ SMART HYBRID VALIDATION - Pick best source for EACH field independently
+            const tmdbHasPoster = tmdbMetadata && tmdbMetadata.poster;
+            const tmdbHasOverview = tmdbMetadata && tmdbMetadata.overview &&
+                tmdbMetadata.overview.trim().length > 30;
 
-            const finalOverview = tmdbMetadata?.overview || (bestMatch?.synopsis || null);
-            const overviewFrom = tmdbMetadata?.overview ? 'tmdb' : (bestMatch?.synopsis ? 'moviesda' : 'none');
+            // Determine poster source (priority: TMDB > Moviesda > placeholder)
+            let finalPoster = null;
+            let posterFrom = 'none';
+
+            if (tmdbHasPoster) {
+                finalPoster = tmdbMetadata.poster;
+                posterFrom = 'tmdb';
+            } else if (bestMatch?.poster_url) {
+                finalPoster = bestMatch.poster_url;
+                posterFrom = 'moviesda';
+            } else {
+                posterFrom = 'placeholder';
+            }
+
+            // Determine overview source (priority: TMDB > Moviesda > Placeholder)
+            let finalOverview = null;
+            let overviewFrom = 'none';
+
+            if (tmdbHasOverview) {
+                finalOverview = tmdbMetadata.overview;
+                overviewFrom = 'tmdb';
+            } else if (bestMatch?.synopsis) {
+                finalOverview = bestMatch.synopsis;
+                overviewFrom = 'moviesda';
+            } else if (tmdbMetadata?.overview) {
+                // Fallback to TMDB even if short, if Moviesda has nothing
+                finalOverview = tmdbMetadata.overview;
+                overviewFrom = 'tmdb';
+            } else {
+                finalOverview = 'Description not available.';
+                overviewFrom = 'placeholder';
+            }
+
+            // Final source is determined by poster source (poster is primary)
+            const metadataSource = posterFrom;
 
             const finalGenres = tmdbMetadata ?
                 (tmdbMetadata.genres || []).map(id => TMDB_GENRES[id]).filter(Boolean).join(', ') :
                 (bestMatch?.genres || '');
 
             unifiedMovie = {
-                title: tmdbMetadata ? tmdbMetadata.title : bestMatch.title,
-                year: tmdbMetadata ? tmdbMetadata.year : (bestMatch.year !== 'Unknown' ? bestMatch.year : null),
-                rating: tmdbMetadata ? tmdbMetadata.rating : bestMatch.rating,
+                title: tmdbHasPoster ? tmdbMetadata.title : (bestMatch?.title || query),
+                year: tmdbHasPoster ? tmdbMetadata.year : (bestMatch?.year !== 'Unknown' ? bestMatch?.year : null),
+                url: bestMatch?.url || '', // ✅ CRITICAL: Top-level URL for Flutter detaill page
+                rating: tmdbHasPoster ? tmdbMetadata.rating : (bestMatch?.rating || null),
                 poster: finalPoster,
-                backdrop: tmdbMetadata?.backdrop || null,
+                backdrop: tmdbHasPoster ? tmdbMetadata.backdrop : null,
                 overview: finalOverview,
-                type: bestMatch?.type || (tmdbMetadata ? 'movie' : 'movie'),
+                type: bestMatch?.type || 'movie',
                 details: {
                     director: tmdbMetadata?.director || bestMatch?.director,
                     starring: tmdbMetadata?.cast || bestMatch?.starring,
                     genres: finalGenres,
                     quality: bestMatch?.quality,
                     source_url: bestMatch?.url,
-                    tmdb_id: tmdbMetadata?.tmdb_id,
-                    metadata_source: tmdbMetadata ? 'tmdb' : 'moviesda',
+                    tmdb_id: tmdbMetadata?.tmdb_id || null,
+                    metadata_source: metadataSource,
                     poster_from: posterFrom,
                     overview_from: overviewFrom
+                },
+                // Explicit metadata tracking for Flutter
+                metadata: {
+                    poster_from: posterFrom,
+                    overview_from: overviewFrom,
+                    source: metadataSource
                 },
                 downloads: (bestMatch?.resolutions || []).map(r => ({
                     name: r.name,
@@ -154,6 +195,11 @@ export async function performUnifiedSearch(query) {
 
 /**
  * Enrich a single movie object with TMDB metadata (Deterministic)
+ * Priority order:
+ * 1️⃣ TMDB (if poster + overview available with length > 30)
+ * 2️⃣ Moviesda (only if TMDB missing/incomplete)
+ * 3️⃣ Placeholder (last fallback)
+ * 
  * @param {Object} movie - Movie object to enrich
  * @returns {Promise<Object>} Enriched movie
  */
@@ -161,47 +207,105 @@ export async function enrichMovie(movie) {
     if (!movie) return null;
 
     try {
-        // Deterministic check: Priority 1 - TMDB
+        // Fetch TMDB metadata
         const tmdb = await searchTMDBMovie(movie.title, movie.year);
 
+        // 🔍 DEBUG LOGGING
+        logger.debug(`[ENRICH] "${movie.title}" (${movie.year || 'no year'})`);
         if (tmdb) {
-            const genreNames = (tmdb.genres || [])
-                .map(id => TMDB_GENRES[id])
-                .filter(Boolean)
-                .join(', ');
-
-            return {
-                ...movie,
-                title: tmdb.title || movie.title,
-                year: (tmdb.year && tmdb.year !== 'Unknown') ? tmdb.year : movie.year,
-                poster_url: tmdb.poster || movie.poster_url,
-                backdrop_url: tmdb.backdrop || movie.backdrop_url,
-                rating: tmdb.rating || movie.rating,
-                synopsis: tmdb.overview || movie.synopsis || movie.description,
-                genres: genreNames || movie.genres || movie.genre,
-                cast: tmdb.cast || movie.cast || movie.starring,
-                director: tmdb.director || movie.director,
-                tmdb_id: tmdb.tmdb_id,
-                source: 'tmdb-enriched'
-            };
+            logger.debug(`  → TMDB: poster=${!!tmdb.poster}, overview=${tmdb.overview?.length || 0} chars`);
+        } else {
+            logger.debug(`  → TMDB: NOT FOUND`);
         }
 
-        // Priority 2: Fallback to Moviesda meta-tags (if missing, scraper might have it)
-        if (!movie.poster_url || movie.poster_url.includes('folder')) {
+        // ✅ SMART HYBRID VALIDATION - Pick best source for EACH field independently
+        // TMDB has poster?
+        const tmdbHasPoster = tmdb && tmdb.poster;
+        // TMDB has valid overview (>30 chars)?
+        const tmdbHasOverview = tmdb && tmdb.overview && tmdb.overview.trim().length > 30;
+        // TMDB is fully valid (complete metadata)?
+        const hasFullTMDB = tmdbHasPoster && tmdbHasOverview;
+
+        // Determine poster source (priority: TMDB > Moviesda > placeholder)
+        let finalPoster = null;
+        let posterSource = 'none';
+
+        if (tmdbHasPoster) {
+            finalPoster = tmdb.poster;
+            posterSource = 'tmdb';
+        } else if (movie.poster_url && !movie.poster_url.includes('folder')) {
+            finalPoster = movie.poster_url;
+            posterSource = 'moviesda';
+        } else {
             const quickPoster = await getQuickPoster(movie.url);
             if (quickPoster) {
-                return {
-                    ...movie,
-                    poster_url: quickPoster,
-                    source: 'moviesda-fallback'
-                };
+                finalPoster = quickPoster;
+                posterSource = 'moviesda';
+            } else {
+                posterSource = 'placeholder';
             }
         }
 
-        return movie;
+        // Determine overview source (priority: TMDB > Moviesda > placeholder)
+        let finalOverview = null;
+        let overviewSource = 'none';
+
+        if (tmdbHasOverview) {
+            finalOverview = tmdb.overview;
+            overviewSource = 'tmdb';
+        } else if (movie.synopsis || movie.description) {
+            finalOverview = movie.synopsis || movie.description;
+            overviewSource = 'moviesda';
+        } else {
+            finalOverview = 'Description not available.';
+            overviewSource = 'placeholder';
+        }
+
+        // Final source is determined by which field(s) came from TMDB
+        const metadataSource = tmdbHasPoster ? 'tmdb' :
+            (posterSource === 'moviesda' ? 'moviesda' : 'placeholder');
+
+        logger.debug(`  → Result: poster=${posterSource}, overview=${overviewSource}, source=${metadataSource}`);
+
+        // Build enriched movie object
+        const genreNames = tmdb ?
+            (tmdb.genres || []).map(id => TMDB_GENRES[id]).filter(Boolean).join(', ') :
+            (movie.genres || movie.genre || '');
+
+        return {
+            ...movie,
+            // Use TMDB title only if we have valid TMDB data
+            title: tmdbHasPoster ? (tmdb.title || movie.title) : movie.title,
+            year: tmdbHasPoster ?
+                ((tmdb.year && tmdb.year !== 'Unknown') ? tmdb.year : movie.year) :
+                movie.year,
+            poster_url: finalPoster,
+            backdrop_url: tmdbHasPoster ? tmdb.backdrop : (movie.backdrop_url || null),
+            rating: tmdbHasPoster ? tmdb.rating : (movie.rating || null),
+            synopsis: finalOverview,
+            genres: genreNames || movie.genres || movie.genre || '',
+            cast: tmdb?.cast || movie.cast || movie.starring,
+            director: tmdb?.director || movie.director,
+            tmdb_id: tmdb?.tmdb_id || null,
+            source: metadataSource === 'tmdb' ? 'tmdb-enriched' : 'moviesda-fallback',
+            // Explicit source tracking for debugging and Flutter
+            metadata: {
+                poster_from: posterSource,
+                overview_from: overviewSource,
+                source: metadataSource
+            }
+        };
     } catch (err) {
         logger.error(`Enrichment failed for "${movie.title}":`, err.message);
-        return movie;
+        return {
+            ...movie,
+            source: 'moviesda-fallback',
+            metadata: {
+                poster_from: 'original',
+                overview_from: 'original',
+                source: 'error-fallback'
+            }
+        };
     }
 }
 

@@ -141,7 +141,10 @@ export async function getTMDBMovieDetails(movieId) {
             poster: movie.poster_path ? `https://image.tmdb.org/t/p/w500${movie.poster_path}` : null,
             backdrop: movie.backdrop_path ? `https://image.tmdb.org/t/p/original${movie.backdrop_path}` : null,
             overview: movie.overview,
-            cast: movie.credits?.cast ? movie.credits.cast.slice(0, 5).map(c => c.name).join(', ') : '',
+            cast: movie.credits?.cast ? movie.credits.cast.slice(0, 5).map(c => ({
+                name: c.name,
+                image: c.profile_path ? `https://image.tmdb.org/t/p/w200${c.profile_path}` : null
+            })) : [],
             director: movie.credits?.crew ? movie.credits.crew.find(c => c.job === 'Director')?.name : '',
             trailer: movie.videos?.results ? movie.videos.results.find(v => v.type === 'Trailer' && v.site === 'YouTube')?.key : null
         };
