@@ -1,0 +1,9 @@
+[dotenv@17.2.3] injecting env (6) from .env -- tip: 🔄 add secrets lifecycle management: https://dotenvx.com/ops
+[2026-01-21T10:20:58.472Z] [INFO] 🔌 Initializing providers...
+[2026-01-21T10:20:58.474Z] [INFO]   ✅ Moviesda (moviesda) - Ready
+[2026-01-21T10:20:58.474Z] [INFO]   ✅ isaiDub (isaidub) - Ready
+[2026-01-21T10:20:58.474Z] [INFO] 🔌 Initialized 2/2 providers
+URL: https://isaidub.love/movie/a-knight-of-the-seven-kingdoms-2026-tamil-dubbed-web-series/
+Detected: isaidub
+Provider: moviesda, BaseURL: https://moviesda15.com
+Provider: isaidub, BaseURL: https://isaidub.love

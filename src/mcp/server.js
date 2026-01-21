@@ -8,13 +8,11 @@ import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { initDb, searchMovies } from '../services/database.js';
-import { searchMoviesDirect, getMovieDownloadLinks, scrapeHome } from '../services/scraper.js';
-import { performUnifiedSearch } from '../services/unifiedSearch.js';
+import providerManager from '../core/providerManager.js';
+import { processItem } from '../core/contentPipeline.js';
 import logger from '../utils/logger.js';
 
-// Initialize database
-initDb();
+// Note: Database initialization is handled by provider-based services where needed
 
 // MCP Server instance
 const mcpServer = new Server(
@@ -130,7 +128,7 @@ async function handleSearchMovies(args) {
         throw new Error('Invalid query: must be a non-empty string');
     }
 
-    const results = await searchMoviesDirect(query);
+    const results = await providerManager.searchAllProviders(query);
 
     if (results.length === 0) {
         return {
@@ -142,7 +140,7 @@ async function handleSearchMovies(args) {
     }
 
     const formatted = results
-        .map(m => `Title: ${m.title} | Year: ${m.year} | Link: ${m.url}`)
+        .map(m => `Title: ${m.title} | Source: ${m.source} | Year: ${m.year} | Link: ${m.url}`)
         .join('\n');
 
     return {
@@ -160,7 +158,7 @@ async function handleGetDownloadLinks(args) {
         throw new Error('Invalid URL: must be a non-empty string');
     }
 
-    const details = await getMovieDownloadLinks(url);
+    const details = await providerManager.getDetailsFromProvider(url);
 
     if (!details) {
         return {
@@ -206,9 +204,9 @@ async function handleGetDownloadLinks(args) {
  * Handle refresh_database tool
  */
 async function handleRefreshDatabase() {
-    // Run scraping in background
-    scrapeHome().catch(err => {
-        logger.error('Background scrape error:', err.message);
+    // For the new architecture, we can trigger re-scrapes by fetching latest
+    providerManager.searchAllProviders('').catch(err => {
+        logger.error('Background refresh error:', err.message);
     });
 
     return {
@@ -229,33 +227,31 @@ async function handleUnifiedMovieSearch(args) {
         throw new Error('Invalid query: must be a non-empty string');
     }
 
-    const result = await performUnifiedSearch(query);
-
-    if (!result.found) {
+    // Search all providers
+    const searchResults = await providerManager.searchAllProviders(query);
+    if (searchResults.length === 0) {
         return {
-            content: [{
-                type: 'text',
-                text: `No unified results found for "${query}".`
-            }]
+            content: [{ type: 'text', text: `No results found for "${query}".` }]
         };
     }
 
-    const { movie } = result;
+    // Process first result with TMDB
+    const movie = await processItem(searchResults[0], searchResults[0].source);
     let text = `🎬 **${movie.title} (${movie.year})**\n`;
     if (movie.rating) text += `⭐ Rating: ${movie.rating}/10\n`;
     if (movie.details?.director) text += `🎥 Director: ${movie.details.director}\n`;
     text += `\n📝 **Overview:**\n${movie.overview || 'No overview available.'}\n\n`;
 
-    if (movie.downloads && movie.downloads.length > 0) {
-        text += `⬇️ **Download/Watch Links (Moviesda):**\n`;
-        movie.downloads.forEach(dl => {
-            text += `\n• **${dl.quality}** (${dl.size})\n`;
-            if (dl.direct_link) text += `  ⚡ [Fast Download](${dl.direct_link})\n`;
-            if (dl.watch_link) text += `  🎬 [Watch Online](${dl.watch_link})\n`;
-            if (dl.link) text += `  🔗 [Download Page](${dl.link})\n`;
+    if (movie.resolutions && movie.resolutions.length > 0) {
+        text += `⬇️ **Download/Watch Links:**\n`;
+        movie.resolutions.forEach(dl => {
+            text += `\n• **${dl.quality}**\n`;
+            if (dl.directUrl) text += `  ⚡ [Fast Download](${dl.directUrl})\n`;
+            if (dl.streamSource) text += `  🎬 [Watch Online](${dl.streamSource})\n`;
+            if (dl.url) text += `  🔗 [Page](${dl.url})\n`;
         });
     } else {
-        text += '\n⚠️ No direct download links found on Moviesda for this title.';
+        text += '\n⚠️ No direct links found for this title.';
     }
 
     const images = [];

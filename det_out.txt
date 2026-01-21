@@ -1,0 +1,7 @@
+Scraping details for: https://isaidub.love/movie/a-knight-of-the-seven-kingdoms-2026-tamil-dubbed-web-series/
+Details scrape failed: ReferenceError: Cannot access 'details' before initialization
+    at Element.<anonymous> (file:///D:/Kalai%20projects/Moviesdaa/moviesdb_backend/src/providers/isaidub/parser.js:68:41)
+    at LoadedCheerio.each (file:///D:/Kalai%20projects/Moviesdaa/moviesdb_backend/node_modules/cheerio/dist/esm/api/traversing.js:484:26)
+    at parseMovieDetails (file:///D:/Kalai%20projects/Moviesdaa/moviesdb_backend/src/providers/isaidub/parser.js:66:25)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async test (file:///D:/Kalai%20projects/Moviesdaa/moviesdb_backend/test_details_new.js:9:25)

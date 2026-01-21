@@ -1,0 +1,20 @@
+Scraping details for: https://isaidub.love/movie/a-knight-of-the-seven-kingdoms-2026-tamil-dubbed-web-series/
+[Explore] Depth 0: Found 1 links on https://isaidub.love/movie/a-knight-of-the-seven-kingdoms-2026-tamil-dubbed-web-series/
+  - Text: "A Knight of the Seven Kingdoms (Season 01)", URL: https://isaidub.love/movie/a-knight-of-the-seven-kingdoms-movie-season-01/
+[Explore] Depth 1: Found 1 links on https://isaidub.love/movie/a-knight-of-the-seven-kingdoms-movie-season-01/
+  - Text: "isaiDub.me - A Knight of the Seven Kingdoms 2026 Season 01 (Epi 01)", URL: https://isaidub.love/download/page/103771/
+--- Details Found ---
+Title: A Knight of the Seven Kingdoms (2026)
+Type: series
+Resolutions: 1
+First Resolution: {
+  quality: 'Episode',
+  name: 'isaiDub.me - A Knight of the Seven Kingdoms 2026 Season 01 (Epi 01)',
+  url: 'https://isaidub.love/download/page/103771/',
+  season: 2026,
+  episode: null,
+  downloadUrl: 'https://dubmv.top/download/file/103771',
+  directUrl: 'https://s03.dubshare.one/isaiDub.me_-_A_Knight_of_the_Seven_Kingdoms_2026_Season_01_Epi_01_.mp4',
+  watchUrl: 'https://dub.onestream.watch/stream/video/103771',
+  streamSource: 'https://s03.dubshare.one/isaiDub.me_-_A_Knight_of_the_Seven_Kingdoms_2026_Season_01_Epi_01_.mp4'
+}
