@@ -32,10 +32,10 @@ function normalizeTitle(title) {
     .toLowerCase()
     .replace(/\(.*?\)/g, '')                    // remove (year), (Season), etc
     .replace(/\[.*?\]/g, '')                    // remove [Tamil], [Dub]
-    .replace(/tamil|dubbed|movie|hdrip|webrip|bluray|dvdrip|web/gi, '')
+    .replace(/isaidub|moviesda|isaimini|tamilgun|tamilrockers/gi, '') // site names
+    .replace(/tamil|dubbed|movie|hdrip|webrip|bluray|dvdrip|web|series/gi, '') // metadata
     .replace(/part\s*\d+/gi, '')                // remove Part 1, Part 2
     .replace(/season\s*\d+/gi, '')              // remove Season 01
-    .replace(/web\s*series/gi, '')              // remove Web Series
     .replace(/original\s*content/gi, '')        // remove Original Content
     .replace(/[^a-z0-9\s]/g, '')                // remove special chars
     .replace(/\s+/g, ' ')                       // normalize spaces
@@ -71,10 +71,6 @@ function detectLanguageType(title, tmdbLanguage) {
 // 2️⃣ TMDB SEARCH (Language-Smart)
 // ============================================================================
 
-/**
- * Search TMDB with language fallback: ta-IN → en-US
- * Returns flat array of results ordered by relevance
- */
 async function searchTMDBWithFallback(query, year = null, isSeries = false) {
   const cleanQuery = normalizeTitle(query);
 
@@ -84,29 +80,12 @@ async function searchTMDBWithFallback(query, year = null, isSeries = false) {
   }
 
   const type = isSeries ? 'tv' : 'movie';
-  logger.debug(`TMDB search (${type}) - Query: "${cleanQuery}", Year: ${year}`);
+  logger.debug(`TMDB search (${type}) - Original: "${query}", Clean: "${cleanQuery}", Year: ${year}`);
 
   try {
     const searches = [];
 
-    // 1️⃣ Try Tamil search with year
-    searches.push(
-      tmdbSearchByLanguage(cleanQuery, year, 'ta', type)
-        .catch(e => {
-          logger.debug(`Tamil (ta) ${type} search failed: ${e.message}`);
-          return [];
-        })
-    );
-
-    // 2️⃣ Try Tamil search without year
-    if (year) {
-      searches.push(
-        tmdbSearchByLanguage(cleanQuery, null, 'ta', type)
-          .catch(e => [])
-      );
-    }
-
-    // 3️⃣ Try English search with year
+    // 1️⃣ Try English search with year (Prioritize for Latin titles)
     searches.push(
       tmdbSearchByLanguage(cleanQuery, year, 'en', type)
         .catch(e => {
@@ -115,10 +94,27 @@ async function searchTMDBWithFallback(query, year = null, isSeries = false) {
         })
     );
 
-    // 4️⃣ Try English search without year
+    // 2️⃣ Try English search without year
     if (year) {
       searches.push(
         tmdbSearchByLanguage(cleanQuery, null, 'en', type)
+          .catch(e => [])
+      );
+    }
+
+    // 3️⃣ Try Tamil search with year
+    searches.push(
+      tmdbSearchByLanguage(cleanQuery, year, 'ta', type)
+        .catch(e => {
+          logger.debug(`Tamil (ta) ${type} search failed: ${e.message}`);
+          return [];
+        })
+    );
+
+    // 4️⃣ Try Tamil search without year
+    if (year) {
+      searches.push(
+        tmdbSearchByLanguage(cleanQuery, null, 'ta', type)
           .catch(e => [])
       );
     }
@@ -190,15 +186,23 @@ function calculateScore(tmdbMovie, moviesdbTitle, moviesdbYear, languageType) {
   const cleanMoviesdbTitle = normalizeTitle(moviesdbTitle);
 
   // 1️⃣ Title Similarity (40 points max)
-  if (tmdbTitle === cleanMoviesdbTitle) {
-    score += 40;  // Perfect match
-  } else if (tmdbTitle.includes(cleanMoviesdbTitle) || cleanMoviesdbTitle.includes(tmdbTitle)) {
-    score += 30;  // Substring match
-  } else if (calculateTitleSimilarity(tmdbTitle, cleanMoviesdbTitle) > 0.8) {
-    score += 25;  // Fuzzy match (80%+ similar)
-  } else if (calculateTitleSimilarity(tmdbTitle, cleanMoviesdbTitle) > 0.6) {
-    score += 15;  // Fuzzy match (60%+ similar)
+  let titleScore = 0;
+  if (tmdbTitle && cleanMoviesdbTitle) {
+    if (tmdbTitle === cleanMoviesdbTitle) {
+      titleScore = 40;  // Perfect match
+    } else if (tmdbTitle.includes(cleanMoviesdbTitle) || cleanMoviesdbTitle.includes(tmdbTitle)) {
+      titleScore = 30;  // Substring match
+    } else {
+      const sim = calculateTitleSimilarity(tmdbTitle, cleanMoviesdbTitle);
+      if (sim > 0.8) titleScore = 25;
+      else if (sim > 0.6) titleScore = 15;
+    }
+  } else if (!tmdbTitle && cleanMoviesdbTitle) {
+    // If TMDB title is empty after normalization (common for regional scripts)
+    // We give a mid-range score (20) if it's the right language context
+    titleScore = 20;
   }
+  score += titleScore;
 
   // 2️⃣ Year Match (25 points)
   if (moviesdbYear) {
@@ -228,6 +232,13 @@ function calculateScore(tmdbMovie, moviesdbTitle, moviesdbYear, languageType) {
     score += 5;    // Popular movie = more trustworthy
   }
 
+  // 4.5️⃣ Recent Release Bonus
+  const currentYear = new Date().getFullYear();
+  const tmdbYearNum = parseInt((tmdbMovie.release_date || tmdbMovie.first_air_date)?.split('-')[0]);
+  if (tmdbYearNum >= currentYear - 1) {
+    score += 5;    // Give +5 for current/previous year movies (likely what user is looking for)
+  }
+
   // 5️⃣ Vote average consideration (slight boost)
   if (tmdbMovie.vote_average > 6.0) {
     score += 2;
@@ -246,9 +257,31 @@ function calculateScore(tmdbMovie, moviesdbTitle, moviesdbYear, languageType) {
  * Using Levenshtein-like comparison
  */
 function calculateTitleSimilarity(str1, str2) {
-  const len = Math.max(str1.length, str2.length);
-  const matches = str1.split('').filter((char, i) => char === str2[i]).length;
-  return matches / len;
+  if (!str1 || !str2) return 0;
+  if (str1 === str2) return 1;
+
+  const s1 = str1.split(' ');
+  const s2 = str2.split(' ');
+
+  // Count how many words in s1 are in s2
+  let matches = 0;
+  s1.forEach(word => {
+    if (word && s2.includes(word)) matches++;
+  });
+
+  const wordSimilarity = matches / Math.max(s1.length, s2.length);
+
+  // Character level fallback for single-word titles
+  if (s1.length === 1 && s2.length === 1) {
+    const len = Math.max(str1.length, str2.length);
+    let charMatches = 0;
+    for (let i = 0; i < Math.min(str1.length, str2.length); i++) {
+      if (str1[i] === str2[i]) charMatches++;
+    }
+    return Math.max(wordSimilarity, charMatches / len);
+  }
+
+  return wordSimilarity;
 }
 
 /**
@@ -256,10 +289,20 @@ function calculateTitleSimilarity(str1, str2) {
  * Minimum score: 60 (strict to avoid wrong matches)
  */
 function selectBestMatch(tmdbResults, moviesdbTitle, moviesdbYear, languageType) {
-  const scored = tmdbResults.map(movie => ({
-    ...movie,
-    confidenceScore: calculateScore(movie, moviesdbTitle, moviesdbYear, languageType)
-  }));
+  const scored = tmdbResults.map(movie => {
+    let score = calculateScore(movie, moviesdbTitle, moviesdbYear, languageType);
+
+    // Bonus: If it's the ONLY result and it's a regional movie that matches the year
+    if (tmdbResults.length === 1 && moviesdbYear) {
+      const tmdbYear = (movie.release_date || movie.first_air_date)?.split('-')[0];
+      if (tmdbYear === moviesdbYear) {
+        score += 15; // Significant boost for unique year-match
+        logger.debug(`Sole result bonus (+15) applied for "${moviesdbTitle}"`);
+      }
+    }
+
+    return { ...movie, confidenceScore: score };
+  });
 
   // Sort by score descending
   const sorted = scored.sort((a, b) => b.confidenceScore - a.confidenceScore);
@@ -386,12 +429,22 @@ export async function matchMoviesdbWithTMDB(moviesdbMovie, moviesdbLinks = []) {
 
   // 3️⃣ Detect language type (Tamil vs Tamil Dubbed)
   const languageType = detectLanguageType(moviesdbMovie.title, 'unknown');
-  logger.debug(`Language type detected: ${languageType}, Series: ${isSeries}`);
+
+  // 3.5️⃣ Enhance year detection (use title if year is missing or Unknown)
+  let bestYear = moviesdbMovie.year;
+  if (!bestYear || bestYear === 'Unknown') {
+    bestYear = extractYear(moviesdbMovie.title);
+    if (bestYear) {
+      logger.debug(`Extracted year from title: ${bestYear}`);
+    }
+  }
+
+  logger.debug(`Language type detected: ${languageType}, Series: ${isSeries}, Year: ${bestYear}`);
 
   // 4️⃣ Search TMDB with language fallback
   const tmdbResults = await searchTMDBWithFallback(
     moviesdbMovie.title,
-    moviesdbMovie.year,
+    bestYear,
     isSeries
   );
 
@@ -404,7 +457,7 @@ export async function matchMoviesdbWithTMDB(moviesdbMovie, moviesdbLinks = []) {
   const bestMatch = selectBestMatch(
     tmdbResults,
     moviesdbMovie.title,
-    moviesdbMovie.year,
+    bestYear,
     languageType
   );
 

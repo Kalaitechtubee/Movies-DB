@@ -423,8 +423,27 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
     const $ = await fetchPage(movieUrl);
     if (!$) return null;
 
+    const pageTitle = ($('h1').text() || $('title').text() || '').trim();
+    let movieTitle = '';
+
+    // Try to find "Movie: Title" or similar labels first (Common in isaidub/moviesda)
+    $('.line, b, strong').each((_, el) => {
+        const text = $(el).text().trim();
+        if (text.startsWith('Movie:') || text.startsWith('Series:')) {
+            movieTitle = text.replace(/Movie:|Series:/i, '').trim();
+            return false;
+        }
+    });
+
+    if (!movieTitle) {
+        movieTitle = pageTitle.replace(/Tamil Movie Download/gi, '')
+            .replace(/Tamil Dubbed/gi, '')
+            .replace(/Download/gi, '')
+            .trim();
+    }
+
     const details = {
-        title: ($('h1').text() || $('.line').first().text() || $('title').text()).trim().replace(/ Tamil Movie$/, ''),
+        title: movieTitle,
         url: movieUrl,
         resolutions: []
     };

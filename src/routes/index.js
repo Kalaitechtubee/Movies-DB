@@ -118,8 +118,8 @@ router.get('/api/search-unified', async (req, res) => {
     try {
         logger.info(`🔍 Unified search: "${query}" (language filter: ${language || 'none'})`);
 
-        // 1️⃣ Search Moviesda first
-        const moviesdbResults = await searchMoviesDirect(query);
+        // 1️⃣ Search Moviesda + isaiDub + Web Series
+        const moviesdbResults = await searchAllDirect(query);
 
         if (moviesdbResults.length === 0) {
             return res.json({
