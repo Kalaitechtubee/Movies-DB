@@ -166,6 +166,100 @@ router.get('/webseries', async (req, res) => {
 });
 
 /**
+ * GET /api/movies/recommendations
+ * 
+ * Get recommendations based on TMDB ID.
+ */
+router.get('/recommendations', async (req, res) => {
+    const { id, type = 'movie' } = req.query;
+    logger.debug(`🔍 Requesting recommendations for TMDB ID: ${id}, Type: ${type}`);
+
+    if (!id || id === 'null' || id === 'undefined') {
+        return res.status(400).json({ error: 'Missing or invalid tmdb_id' });
+    }
+
+    try {
+        const tmdb = await import('../services/tmdb/client.js');
+        const client = tmdb.default || tmdb;
+
+        // 1. Get recommendations from TMDB
+        const recs = await client.getRecommendations(id, type, 'ta-IN');
+
+        if (!recs || recs.length === 0) {
+            // Fallback to English if Tamil returns nothing
+            const fallbackRecs = await client.getRecommendations(id, type, 'en-US');
+            if (fallbackRecs.length > 0) recs.push(...fallbackRecs);
+        }
+
+        // 2. Filter by availability in our database (Unified Catalog)
+        const tmdbIdsList = recs.slice(0, 20).map(r => r.id);
+        if (tmdbIdsList.length === 0) return res.json([]);
+
+        const { data: available } = await supabase
+            .from('unified_movies')
+            .select('*')
+            .in('tmdb_id', tmdbIdsList);
+
+        const formatted = (available || []).map(m => ({
+            id: m.id,
+            tmdb_id: m.tmdb_id,
+            title: m.title,
+            year: m.year,
+            poster_url: m.poster_url,
+            rating: m.rating,
+            quality: m.quality || 'DVD/HD',
+            content_type: m.content_type,
+            language_type: m.language_type,
+            url: m.url
+        }));
+
+        // 3. FALLBACK: If we have few recommendations, try to find the others in the raw 'movies' table
+        if (formatted.length < 10) {
+            const existingTitles = new Set(formatted.map(f => f.title.toLowerCase()));
+            const missingRecs = recs.filter(r => !existingTitles.has((r.title || r.name).toLowerCase())).slice(0, 15);
+
+            for (const rec of missingRecs) {
+                const title = rec.title || rec.name;
+                const cleanTitle = title.split(':')[0].split('-')[0].trim();
+
+                // Search raw scraper data
+                const { data: rawMatches } = await supabase
+                    .from('movies')
+                    .select('*')
+                    .ilike('title', `%${cleanTitle}%`)
+                    .limit(1);
+
+                if (rawMatches && rawMatches.length > 0) {
+                    const m = rawMatches[0];
+                    if (!existingTitles.has(m.title.toLowerCase())) {
+                        formatted.push({
+                            id: m.id,
+                            tmdb_id: rec.id, // Use TMDB ID from recommendation
+                            title: m.title,
+                            year: m.year,
+                            poster_url: m.poster_url || `https://image.tmdb.org/t/p/w500${rec.poster_path}`,
+                            rating: rec.vote_average?.toString() || m.rating,
+                            quality: m.quality || 'DVD/HD',
+                            content_type: type,
+                            language_type: 'unknown',
+                            url: m.url
+                        });
+                        existingTitles.add(m.title.toLowerCase());
+                    }
+                }
+
+                if (formatted.length >= 15) break;
+            }
+        }
+
+        res.json(formatted);
+    } catch (error) {
+        logger.error(`Recommendations error: ${error.message}`);
+        res.status(500).json({ error: 'Failed to fetch recommendations' });
+    }
+});
+
+/**
  * GET /api/movie/:tmdbId
  * 
  * Get movie by TMDB ID.
@@ -223,5 +317,6 @@ router.get('/:tmdbId', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch movie details' });
     }
 });
+
 
 export default router;

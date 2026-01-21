@@ -15,6 +15,9 @@ import { TMDB_API_KEY } from '../../config.js';
 // API key from configuration
 const API_KEY = TMDB_API_KEY;
 
+import http from 'http';
+import https from 'https';
+
 // Axios instance with defaults
 const tmdbApi = axios.create({
     baseURL: TMDB_BASE_URL,
@@ -23,10 +26,13 @@ const tmdbApi = axios.create({
         language: 'en-US',
         include_adult: false
     },
-    timeout: 20000, // 20 seconds
+    timeout: 30000, // 30 seconds
+    // Use IPv4 to avoid ECONNRESET issues on some networks
+    httpAgent: new http.Agent({ family: 4 }),
+    httpsAgent: new https.Agent({ family: 4, keepAlive: true }),
     headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'Accept-Encoding': 'identity' // Avoid compression issues
     }
 });
 
@@ -241,6 +247,31 @@ export async function getTrailerKey(id, type = 'movie') {
 }
 
 /**
+ * Get recommendations for a movie or TV show
+ * @param {number} id - TMDB ID
+ * @param {string} type - 'movie' or 'tv'
+ * @param {string} language - Language code (e.g. 'ta-IN')
+ * @returns {Promise<Array>} Recommended items
+ */
+export async function getRecommendations(id, type = 'movie', language = 'ta-IN') {
+    if (!API_KEY || !id) return [];
+
+    const cacheKey = `recommendations:${type}:${id}:${language}`;
+
+    try {
+        return await cachedRequest(cacheKey, async () => {
+            const response = await tmdbApi.get(`/${type}/${id}/recommendations`, {
+                params: { language }
+            });
+            return response.data.results || [];
+        });
+    } catch (error) {
+        console.error(`TMDB recommendations failed for ${type}/${id}: ${error.message}`);
+        return [];
+    }
+}
+
+/**
  * Check if TMDB API is configured and working
  * @returns {Promise<boolean>} Health status
  */
@@ -268,6 +299,7 @@ export default {
     getCredits,
     getVideos,
     getTrending,
+    getRecommendations,
     getPosterUrl,
     getBackdropUrl,
     getTrailerKey,
