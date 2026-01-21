@@ -236,10 +236,17 @@ function parseMovies($, year = 'Unknown', siteBase = BASE_URL) {
         // Extract quality from font tag if present
         const quality = $(element).find('font[color="blue"]').text().trim() || 'DVD/HD';
 
+        // Extract poster if present
+        const poster = $(element).find('img').attr('src');
+        const fullPosterUrl = poster && !poster.includes('folder.svg') && !poster.includes('folder.png')
+            ? (poster.startsWith('http') ? poster : `${siteBase}${poster.startsWith('/') ? '' : '/'}${poster}`)
+            : null;
+
         movies.push({
             title,
             url: fullUrl,
             year,
+            poster: fullPosterUrl,
             quality: quality || 'DVD/HD'
         });
     });
@@ -322,7 +329,10 @@ export async function getQuickPoster(url) {
             $('.movie-info-container img').first().attr('src') ||
             $('.header-poster img').first().attr('src') ||
             $('center img').first().attr('src') ||
-            $('.f img').first().attr('src');
+            $('center > a > img').first().attr('src') ||
+            $('.line img').first().attr('src') ||
+            $('.f img').first().attr('src') ||
+            $('img[src*=".jp"]').first().attr('src');
 
         if (poster && !poster.startsWith('http')) {
             const urlObj = new URL(url);
@@ -421,7 +431,18 @@ export async function getMovieDownloadLinks(movieUrl, query = '') {
 
     // Extract basic meta if available on page
     details.poster_url = await getQuickPoster(movieUrl);
-    details.synopsis = $('.movie-synopsis').text().trim() || $('.line').last().text().trim();
+
+    // Better quality extraction from titles or text
+    const qualityMatch = details.title.match(/HD|720p|1080p|DVD|HDRip|BDRip|Dub/i) ||
+        $.text().match(/Quality\s*:\s*([^<\n\r]+)/i) ||
+        $.text().match(/HD|720p|1080p|DVD|HDRip|BDRip/i);
+    details.quality = qualityMatch ? (Array.isArray(qualityMatch) ? qualityMatch[1] || qualityMatch[0] : qualityMatch) : 'DVD/HD';
+
+    details.synopsis = $('.movie-synopsis').text().trim() ||
+        $('.line:contains("Synopsis")').next().text().trim() ||
+        $('.line').last().text().trim();
+
+    if (details.synopsis.length < 10) details.synopsis = `Watch ${details.title} online in high quality. Download ${details.title} in various resolutions.`;
 
     const discoveredFiles = new Map();
     const visited = new Set();
@@ -774,10 +795,14 @@ export async function getLatestUpdates() {
                 const yearMatch = title.match(/\((\d{4})\)/) || title.match(/\s(\d{4})\s/) || fullUrl.match(/(\d{4})/);
                 const year = yearMatch ? yearMatch[1] : 'Unknown';
 
+                const poster = $(el).find('img').attr('src');
+                const fullPosterUrl = poster ? (poster.startsWith('http') ? poster : `${BASE_URL}${poster.startsWith('/') ? '' : '/'}${poster}`) : null;
+
                 movies.push({
                     title: cleanTitle(title) + langSuffix,
                     url: fullUrl,
                     year,
+                    poster: fullPosterUrl,
                     quality: $(el).find('font[color="blue"]').text().trim() || 'DVD/HD',
                     source: fullUrl.includes('isaidub') ? 'isaidub' : (fullUrl.includes('web-series') ? 'webseries' : 'moviesda')
                 });
@@ -814,56 +839,61 @@ export async function getIsaidubLatest() {
     if (!$) return [];
 
     const movies = [];
+    $('a[href*="/movie/"]').each((_, el) => {
+        const href = $(el).attr('href');
+        const title = $(el).text().trim();
+        const isTamil = title.toLowerCase().includes('tamil') || href.toLowerCase().includes('tamil');
 
-    // Try reliable section first
-    const latestSection = $('.line:contains("isaiDub Latest Updates")');
-
-    if (latestSection.length > 0) {
-        latestSection.nextUntil('.line', '.f').each((_, el) => {
-            const link = $(el).find('a').first();
-            const href = link.attr('href');
-            let title = $(el).text().split('(')[0].trim();
-
-            // Filter for Tamil content
-            const isTamil = title.toLowerCase().includes('tamil') || href?.toLowerCase().includes('tamil');
-
-            if (href && title && isTamil && !title.includes('Updates')) {
-                const fullUrl = href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`;
-                movies.push({
-                    title,
-                    url: fullUrl,
-                    year: title.match(/\(\d{4}\)/)?.[0]?.replace(/[()]/g, '') || 'Unknown',
-                    quality: 'DVD/HD',
-                    source: 'isaidub'
-                });
-            }
-        });
-    }
-
-    // Fallback: Scraping any movie links from homepage if section not found
-    if (movies.length === 0) {
-        $('a[href*="/movie/"]').each((_, el) => {
-            const href = $(el).attr('href');
-            const title = $(el).text().trim();
-
-            // Strictly Tamil only
-            const isTamil = title.toLowerCase().includes('tamil') || href.toLowerCase().includes('tamil');
-
-            if (title && isTamil && !title.includes('Download') && !title.includes('Collection') && !title.includes('Updates')) {
-                const fullUrl = href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`;
-                movies.push({
-                    title,
-                    url: fullUrl,
-                    year: title.match(/\(\d{4}\)/)?.[0]?.replace(/[()]/g, '') || 'Unknown',
-                    quality: 'DVD/HD',
-                    source: 'isaidub'
-                });
-            }
-        });
-    }
+        if (title && isTamil && !title.includes('Download') && !title.includes('Collection') && !title.includes('Updates')) {
+            const fullUrl = href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`;
+            movies.push({
+                title,
+                url: fullUrl,
+                year: title.match(/\(\d{4}\)/)?.[0]?.replace(/[()]/g, '') || 'Unknown',
+                quality: 'DVD/HD',
+                source: 'isaidub'
+            });
+        }
+    });
 
     logger.info(`Found ${movies.length} isaiDub updates`);
     return movies;
+}
+
+/**
+ * Specifically search isaidub for dubbed movies
+ */
+export async function searchIsaidubSpecific(query) {
+    const results = [];
+    // Try the main dubbed movies page first
+    const $ = await fetchPage(`${ISAIDUB_BASE_URL}/tamil-dubbed-movies/`);
+    if (!$) return results;
+
+    const targetYears = ['2026', '2025', '2024'];
+    const matchingCategories = [];
+
+    $('.f a').each((_, el) => {
+        const text = $(el).text();
+        const href = $(el).attr('href');
+        // Strictly Tamil only
+        const isTamil = text.toLowerCase().includes('tamil') || href?.toLowerCase().includes('tamil');
+
+        if (isTamil && (targetYears.some(y => text.includes(y)) || fuzzyMatch(text, query))) {
+            matchingCategories.push({
+                url: href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`,
+                year: text.match(/\d{4}/)?.[0] || 'Dubbed'
+            });
+        }
+    });
+
+    // Limit to 2 most relevant categories to keep search fast
+    for (const cat of matchingCategories.slice(0, 2)) {
+        const movies = await scrapeAllPages(cat.url, 1, cat.year);
+        // Ensure only Tamil results are merged
+        results.push(...movies.map(m => ({ ...m, source: 'isaidub' })));
+    }
+
+    return results;
 }
 
 
@@ -939,40 +969,6 @@ export async function searchAllDirect(query) {
     return finalResults;
 }
 
-/**
- * Specifically search isaidub for dubbed movies
- */
-async function searchIsaidubSpecific(query) {
-    const results = [];
-    const $ = await fetchPage(`${ISAIDUB_BASE_URL}/tamil-dubbed-movies-download/`);
-    if (!$) return results;
-
-    const targetYears = ['2026', '2025', '2024'];
-    const matchingCategories = [];
-
-    $('.f a').each((_, el) => {
-        const text = $(el).text();
-        const href = $(el).attr('href');
-        // Strictly Tamil only
-        const isTamil = text.toLowerCase().includes('tamil') || href?.toLowerCase().includes('tamil');
-
-        if (isTamil && (targetYears.some(y => text.includes(y)) || fuzzyMatch(text, query))) {
-            matchingCategories.push({
-                url: href.startsWith('http') ? href : `${ISAIDUB_BASE_URL}${href}`,
-                year: text.match(/\d{4}/)?.[0] || 'Dubbed'
-            });
-        }
-    });
-
-    // Limit to 2 most relevant categories to keep search fast
-    for (const cat of matchingCategories.slice(0, 2)) {
-        const movies = await scrapeAllPages(cat.url, 1, cat.year);
-        // Ensure only Tamil results are merged
-        results.push(...movies.map(m => ({ ...m, source: 'isaidub' })));
-    }
-
-    return results;
-}
 
 /**
  * Specifically search web series section

@@ -70,17 +70,28 @@ CREATE INDEX IF NOT EXISTS idx_movies_year ON movies(year);
 -- Unified Movies Table
 CREATE TABLE IF NOT EXISTS unified_movies (
     id SERIAL PRIMARY KEY,
+    tmdb_id INTEGER UNIQUE,
     title TEXT NOT NULL,
     year TEXT,
     rating TEXT,
     poster_url TEXT,
     backdrop_url TEXT,
     overview TEXT,
-    details JSONB,
-    downloads JSONB,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(title, year)
+    genres TEXT,
+    runtime INTEGER,
+    language_type TEXT,
+    cast JSONB,
+    director TEXT,
+    trailer_key TEXT,
+    watch_links JSONB,
+    download_links JSONB,
+    confidence_score INTEGER,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_unified_tmdb_id ON unified_movies(tmdb_id);
+CREATE INDEX IF NOT EXISTS idx_unified_lang ON unified_movies(language_type);
+CREATE INDEX IF NOT EXISTS idx_unified_title ON unified_movies USING gin(to_tsvector('english', title));
     `.trim();
 }
 
@@ -122,58 +133,90 @@ export async function insertMovie(movie) {
 }
 
 /**
- * Get unified movie from cache
- * @param {string} title - Movie title
- * @param {string} year - Release year
+ * Get unified movie by TMDB ID
+ * @param {number} tmdbId - TMDB Movie ID
  */
-export async function getUnifiedMovie(title, year) {
-    if (!supabase) return null;
+export async function getUnifiedMovieByTMDBId(tmdbId) {
+    if (!supabase || !tmdbId) return null;
     try {
         const { data, error } = await supabase
             .from(UNIFIED_TABLE_NAME)
             .select('*')
-            .eq('title', title)
-            .eq('year', year || 'Unknown')
+            .eq('tmdb_id', tmdbId)
             .single();
 
         if (error && error.code !== 'PGRST116') {
-            logger.error('Get unified movie error:', error.message);
+            logger.error('Get unified movie by TMDB ID error:', error.message);
             return null;
         }
 
         return data;
     } catch (err) {
-        logger.error('Failed to get unified movie:', err.message);
+        logger.error('Failed to get unified movie by TMDB ID:', err.message);
         return null;
     }
 }
 
 /**
- * Insert/Update unified movie cache
- * @param {Object} movie - Unified movie object
+ * Get all unified movies (paginated)
+ */
+export async function getAllUnifiedMovies(limit = 20, offset = 0, language = null) {
+    if (!supabase) return [];
+    try {
+        let query = supabase
+            .from(UNIFIED_TABLE_NAME)
+            .select('*')
+            .order('updated_at', { ascending: false })
+            .range(offset, offset + limit - 1);
+
+        if (language) {
+            query = query.eq('language_type', language);
+        }
+
+        const { data, error } = await query;
+
+        if (error) {
+            logger.error('Get all unified movies error:', error.message);
+            return [];
+        }
+
+        return data || [];
+    } catch (err) {
+        logger.error('Failed to get unified movies:', err.message);
+        return [];
+    }
+}
+
+/**
+ * Insert/Update unified movie
+ * @param {Object} movie - Unified movie object from tmdbMatcher
  */
 export async function insertUnifiedMovie(movie) {
     if (!supabase) return;
     try {
         const { error } = await supabase
             .from(UNIFIED_TABLE_NAME)
-            .upsert(
-                {
-                    title: movie.title,
-                    year: movie.year || 'Unknown',
-                    rating: movie.rating || null,
-                    poster_url: movie.poster || null,
-                    backdrop_url: movie.backdrop || null,
-                    overview: movie.overview || null,
-                    details: movie.details || {},
-                    downloads: movie.downloads || [],
-                    updated_at: new Date().toISOString()
-                },
-                {
-                    onConflict: 'title,year',
-                    ignoreDuplicates: false
-                }
-            );
+            .upsert({
+                tmdb_id: movie.tmdb_id,
+                title: movie.title,
+                year: movie.year || 'Unknown',
+                rating: movie.rating || null,
+                poster_url: movie.poster_url || movie.poster || null,
+                backdrop_url: movie.backdrop_url || movie.backdrop || null,
+                overview: movie.overview || null,
+                genres: movie.genres || null,
+                runtime: movie.runtime || null,
+                language_type: movie.language_type || 'unknown',
+                cast: movie.movie_cast || movie.cast || [],
+                director: movie.director || null,
+                trailer_key: movie.trailer || movie.trailer_key || null,
+                watch_links: movie.watch_links || [],
+                download_links: movie.download_links || [],
+                confidence_score: movie.confidence_score || 0,
+                updated_at: new Date().toISOString()
+            }, {
+                onConflict: 'tmdb_id'
+            });
 
         if (error) {
             logger.error('Insert unified movie error:', error.message);

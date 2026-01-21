@@ -17,7 +17,7 @@ export const TMDB_API_KEY = process.env.TMDB_API_KEY;
 
 // Target Website Configuration
 export const BASE_URL = 'https://moviesda15.com';
-export const ISAIDUB_BASE_URL = 'https://isaidub.love';
+export const ISAIDUB_BASE_URL = 'https://www.isaidub.app';
 
 // HTTP Request Configuration
 export const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';

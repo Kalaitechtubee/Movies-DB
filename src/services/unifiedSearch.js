@@ -5,7 +5,13 @@
 
 import { searchTMDBMovie, getTMDBMovieDetails } from './tmdb.js';
 import { searchMoviesDirect, getMovieDownloadLinks, cleanTitle, getQuickPoster } from './scraper.js';
-import { searchMovies, insertMovie, getUnifiedMovie, insertUnifiedMovie } from './database.js';
+import {
+    searchMovies,
+    insertMovie,
+    getUnifiedMovie,
+    insertUnifiedMovie,
+    getUnifiedMovieByTMDBId
+} from './database.js';
 import logger from '../utils/logger.js';
 
 const TMDB_GENRES = {
@@ -23,180 +29,140 @@ const TMDB_GENRES = {
  * @returns {Promise<Object>} Unified search results
  */
 export async function performUnifiedSearch(query) {
-    logger.info(`Starting deterministic unified search for: ${query}`);
+    logger.info(`Starting TMDB-anchored unified search for: ${query}`);
 
     try {
-        // 1. Search TMDB first (Metadata Authority)
-        const isSeries = query.toLowerCase().includes('season') ||
-            query.toLowerCase().includes('web series') ||
+        // 1. Search Moviesda FIRST (Availability is key)
+        let moviesdaResults = await searchMovies(query);
+        if (moviesdaResults.length === 0) {
+            moviesdaResults = await searchMoviesDirect(query);
+        }
+
+        if (moviesdaResults.length === 0) {
+            logger.info(`No results found on Moviesda for: ${query}`);
+            return { query, found: false, movie: null };
+        }
+
+        // 2. Take the most relevant result and find its TMDB ID
+        const primaryMatch = moviesdaResults[0];
+        const isSeries = primaryMatch.type === 'series' ||
+            primaryMatch.url.includes('web-series') ||
+            query.toLowerCase().includes('season') ||
             query.toLowerCase().includes('episode');
 
-        const tmdbMetadata = await searchTMDBMovie(query, 'Unknown', isSeries ? 'series' : 'movie');
-
-        // 2. Normalize title and year for Moviesda search
-        const searchTitle = tmdbMetadata ? tmdbMetadata.title : query;
-        const searchYear = tmdbMetadata ? tmdbMetadata.year : 'Unknown';
-
-        // Check Cache first for EXACT deterministic result
-        const cached = await getUnifiedMovie(searchTitle, searchYear);
+        // Check cache by title/year first
+        const cached = await getUnifiedMovie(primaryMatch.title, primaryMatch.year);
         if (cached && cached.downloads && cached.downloads.length > 0) {
-            logger.info(`Deterministic cache hit for: ${searchTitle} (${searchYear})`);
+            logger.info(`Unified cache hit for: ${primaryMatch.title} (${primaryMatch.year})`);
             return {
                 query,
                 found: true,
-                source: { metadata: cached.details?.metadata_source || 'cache', links: 'cache' },
                 movie: {
-                    title: cached.title,
-                    year: cached.year,
-                    url: cached.url || '',
-                    rating: cached.rating,
+                    ...cached,
                     poster: cached.poster_url,
                     backdrop: cached.backdrop_url,
-                    overview: cached.overview,
-                    details: cached.details,
-                    downloads: cached.downloads
+                    tmdb_id: cached.tmdb_id || cached.details?.tmdb_id
                 }
             };
         }
 
-        logger.debug(`Unified Search: Searching Moviesda for links only`);
+        // 3. Search TMDB using the CLEAN title from Moviesda
+        const tmdbMetadata = await searchTMDBMovie(primaryMatch.title, primaryMatch.year, isSeries ? 'series' : 'movie');
 
-        // 3. Search Moviesda for technical links
-        let moviesdaResults = await searchMovies(searchTitle);
-        if (moviesdaResults.length === 0) {
-            moviesdaResults = await searchMoviesDirect(searchTitle);
-        }
+        // 4. If TMDB match found, get FULL details (Trailers, Cast, etc.)
+        let fullMetadata = tmdbMetadata;
+        if (tmdbMetadata?.tmdb_id) {
+            // Check if we have this TMDB ID cached specifically
+            const tmdbCached = await getUnifiedMovieByTMDBId(tmdbMetadata.tmdb_id);
 
-        // 4. Find best match on Moviesda (Strictly for links)
-        let bestMatch = null;
-        if (moviesdaResults.length > 0) {
-            if (tmdbMetadata) {
-                bestMatch = moviesdaResults.find(m => {
-                    const mYear = m.year || '';
-                    const titleMatch = m.title.toLowerCase().includes(tmdbMetadata.title.toLowerCase()) ||
-                        tmdbMetadata.title.toLowerCase().includes(m.title.toLowerCase());
-                    const yearMatch = (mYear === tmdbMetadata.year || mYear === 'Unknown');
-                    return titleMatch && yearMatch;
-                });
-            }
-            if (!bestMatch) bestMatch = moviesdaResults[0];
-        }
-
-        // 5. Build Unified Response (Metadata-First Decision logic)
-        let unifiedMovie = null;
-
-        if (bestMatch || tmdbMetadata) {
-            // Get download links from Moviesda if match found
-            if (bestMatch && (!bestMatch.resolutions || bestMatch.resolutions.length === 0)) {
-                const fullDetails = await getMovieDownloadLinks(bestMatch.url, query);
-                if (fullDetails) {
-                    bestMatch = { ...bestMatch, ...fullDetails };
-                }
+            if (tmdbCached) {
+                // Merge Moviesda links into cached TMDB entry
+                const scraperDetails = await getMovieDownloadLinks(primaryMatch.url, query);
+                const updatedMovie = {
+                    ...tmdbCached,
+                    downloads: scraperDetails?.resolutions?.map(r => ({
+                        name: r.name,
+                        quality: r.quality,
+                        size: r.size || 'Unknown',
+                        link: r.downloadUrl,
+                        direct_link: r.directUrl,
+                        watch_link: r.watchUrl,
+                        stream_source: r.streamSource
+                    })) || []
+                };
+                await insertUnifiedMovie(updatedMovie);
+                return { query, found: true, movie: updatedMovie };
             }
 
-            // ✅ SMART HYBRID VALIDATION - Pick best source for EACH field independently
-            const tmdbHasPoster = tmdbMetadata && tmdbMetadata.poster;
-            const tmdbHasOverview = tmdbMetadata && tmdbMetadata.overview &&
-                tmdbMetadata.overview.trim().length > 30;
+            // Fetch full details if not cached or to refresh
+            const detailed = await getTMDBMovieDetails(tmdbMetadata.tmdb_id, tmdbMetadata.type || (isSeries ? 'series' : 'movie'));
+            if (detailed) {
+                fullMetadata = { ...tmdbMetadata, ...detailed };
+            }
+        }
 
-            // Determine poster source (priority: TMDB > Moviesda > placeholder)
-            let finalPoster = null;
-            let posterFrom = 'none';
+        // 5. Get download links from Moviesda
+        const scraperDetails = await getMovieDownloadLinks(primaryMatch.url, query);
 
-            if (tmdbHasPoster) {
-                finalPoster = tmdbMetadata.poster;
-                posterFrom = 'tmdb';
+        // 6. Assemble Final TMDB-Anchored Movie
+        const currentYear = new Date().getFullYear();
+        const movieYear = parseInt(fullMetadata?.year || primaryMatch.year);
+        let tmdbStatus = 'matched';
+
+        if (!fullMetadata?.tmdb_id) {
+            // If it's this year or last year, treat as pending. Older is not_found.
+            if (movieYear >= (currentYear - 1) || !movieYear) {
+                tmdbStatus = 'pending';
             } else {
-                // FALLBACK: Try to get poster from Moviesda if TMDB failed
-                const moviesdaPoster = bestMatch?.poster_url || (bestMatch?.url ? await getQuickPoster(bestMatch.url) : null);
-                if (moviesdaPoster) {
-                    finalPoster = moviesdaPoster;
-                    posterFrom = 'moviesda';
-                } else {
-                    posterFrom = 'placeholder';
-                }
+                tmdbStatus = 'not_found';
             }
-
-            // Determine overview source (priority: TMDB > Moviesda > Placeholder)
-            let finalOverview = null;
-            let overviewFrom = 'none';
-
-            if (tmdbHasOverview) {
-                finalOverview = tmdbMetadata.overview;
-                overviewFrom = 'tmdb';
-            } else if (bestMatch?.synopsis) {
-                finalOverview = bestMatch.synopsis;
-                overviewFrom = 'moviesda';
-            } else if (tmdbMetadata?.overview) {
-                // Fallback to TMDB even if short, if Moviesda has nothing
-                finalOverview = tmdbMetadata.overview;
-                overviewFrom = 'tmdb';
-            } else {
-                finalOverview = 'Description not available.';
-                overviewFrom = 'placeholder';
-            }
-
-            // Final source is determined by poster source (poster is primary)
-            const metadataSource = posterFrom;
-
-            const finalGenres = tmdbMetadata ?
-                (tmdbMetadata.genres || []).map(id => TMDB_GENRES[id]).filter(Boolean).join(', ') :
-                (bestMatch?.genres || '');
-
-            unifiedMovie = {
-                title: tmdbHasPoster ? tmdbMetadata.title : (bestMatch?.title || query),
-                year: tmdbHasPoster ? tmdbMetadata.year : (bestMatch?.year !== 'Unknown' ? bestMatch?.year : null),
-                url: bestMatch?.url || '', // ✅ CRITICAL: Top-level URL for Flutter detaill page
-                rating: tmdbHasPoster ? tmdbMetadata.rating : (bestMatch?.rating || null),
-                poster: finalPoster,
-                backdrop: tmdbHasPoster ? tmdbMetadata.backdrop : null,
-                overview: finalOverview,
-                type: bestMatch?.type || 'movie',
-                details: {
-                    director: tmdbMetadata?.director || bestMatch?.director,
-                    starring: tmdbMetadata?.cast || bestMatch?.starring,
-                    genres: finalGenres,
-                    quality: bestMatch?.quality,
-                    source_url: bestMatch?.url,
-                    tmdb_id: tmdbMetadata?.tmdb_id || null,
-                    metadata_source: metadataSource,
-                    poster_from: posterFrom,
-                    overview_from: overviewFrom
-                },
-                // Explicit metadata tracking for Flutter
-                metadata: {
-                    poster_from: posterFrom,
-                    overview_from: overviewFrom,
-                    source: metadataSource
-                },
-                downloads: (bestMatch?.resolutions || []).map(r => ({
-                    name: r.name,
-                    quality: r.quality,
-                    size: r.size || 'Unknown',
-                    season: r.season,
-                    episode: r.episode,
-                    link: r.downloadUrl,
-                    direct_link: r.directUrl,
-                    watch_link: r.watchUrl,
-                    stream_source: r.streamSource
-                }))
-            };
         }
 
-        // 6. Cache the FINAL decision
+        const unifiedMovie = {
+            tmdb_id: fullMetadata?.tmdb_id || null,
+            tmdb_status: tmdbStatus, // New explicit status field
+            title: fullMetadata?.title || primaryMatch.title,
+            year: fullMetadata?.year || primaryMatch.year,
+            url: primaryMatch.url,
+            rating: fullMetadata?.rating || primaryMatch.rating,
+            poster: fullMetadata?.poster || primaryMatch.poster_url || primaryMatch.poster,
+            backdrop: fullMetadata?.backdrop || null,
+            overview: fullMetadata?.overview || scraperDetails?.synopsis || 'Description not available yet. We are waiting for official metadata release.',
+            trailer: fullMetadata?.trailer || null,
+            type: primaryMatch.type || (isSeries ? 'series' : 'movie'),
+            details: {
+                director: fullMetadata?.director || scraperDetails?.director,
+                starring: fullMetadata?.cast || scraperDetails?.starring,
+                genres: fullMetadata?.genres || scraperDetails?.genres,
+                tmdb_id: fullMetadata?.tmdb_id || null,
+                tmdb_status: tmdbStatus,
+                metadata_source: fullMetadata ? 'tmdb' : 'scraper',
+            },
+            downloads: (scraperDetails?.resolutions || []).map(r => ({
+                name: r.name,
+                quality: r.quality,
+                size: r.size || 'Unknown',
+                link: r.downloadUrl,
+                direct_link: r.directUrl,
+                watch_link: r.watchUrl,
+                stream_source: r.streamSource
+            }))
+        };
+
+        // 7. Cache the result
         if (unifiedMovie) {
             await insertUnifiedMovie(unifiedMovie);
         }
 
         return {
             query,
-            found: !!unifiedMovie,
-            source: unifiedMovie?.details?.metadata_source || 'none',
+            found: true,
+            source: fullMetadata ? 'tmdb' : 'moviesda',
             movie: unifiedMovie
         };
 
     } catch (error) {
-        logger.error(`Unified search failed for "${query}":`, error.message);
+        logger.error(`Unified TMDB search failed for "${query}":`, error.message);
         throw error;
     }
 }
@@ -216,25 +182,41 @@ export async function enrichMovie(movie) {
 
     try {
         // 1. Determine if this is a series
+        const titleLower = movie.title.toLowerCase();
         const isSeries = movie.type === 'series' ||
             movie.url.includes('web-series') ||
-            movie.title.toLowerCase().includes('season') ||
-            movie.title.toLowerCase().includes('episode');
+            titleLower.includes('season') ||
+            titleLower.includes('episode') ||
+            titleLower.includes('web series') ||
+            titleLower.includes('original content');
 
         // 2. Fetch TMDB metadata (passing series type)
-        const tmdb = await searchTMDBMovie(movie.title, movie.year, isSeries ? 'series' : 'movie');
+        let tmdb = await searchTMDBMovie(movie.title, movie.year, isSeries ? 'series' : 'movie');
 
-        // 🔍 DEBUG LOGGING
-        logger.debug(`[ENRICH] "${movie.title}" (${movie.year || 'no year'}) - Series: ${isSeries}`);
-        if (tmdb) {
-            logger.debug(`  → TMDB: poster=${!!tmdb.poster}, overview=${tmdb.overview?.length || 0} chars`);
-        } else {
-            logger.debug(`  → TMDB: NOT FOUND`);
+        // 3. If TMDB match found, get FULL details (Trailers, Cast, Director)
+        if (tmdb?.tmdb_id) {
+            const detailed = await getTMDBMovieDetails(tmdb.tmdb_id, tmdb.type || (isSeries ? 'series' : 'movie'));
+            if (detailed) {
+                tmdb = { ...tmdb, ...detailed };
+            }
         }
 
         // ✅ SMART HYBRID VALIDATION - Pick best source for EACH field independently
         const tmdbHasPoster = tmdb && tmdb.poster;
         const tmdbHasOverview = tmdb && tmdb.overview && tmdb.overview.trim().length > 30;
+
+        // Determine TMDB Status
+        const currentYear = new Date().getFullYear();
+        const movieYear = parseInt(tmdb?.year || movie.year);
+        let tmdbStatus = 'matched';
+
+        if (!tmdb?.tmdb_id) {
+            if (movieYear >= currentYear || !movieYear) {
+                tmdbStatus = 'pending';
+            } else {
+                tmdbStatus = 'not_found';
+            }
+        }
 
         // Decision logic: Pick best poster
         let finalPoster = null;
@@ -302,24 +284,43 @@ export async function enrichMovie(movie) {
             synopsis: finalOverview,
             genres: genreNames || movie.genres || movie.genre || '',
             cast: tmdb?.cast || movie.cast || movie.starring,
+            director: tmdb?.director || movie.director,
+            trailer: tmdb?.trailer || null,
             tmdb_id: tmdb?.tmdb_id || null,
+            tmdb_status: tmdbStatus,
             source: tmdbHasPoster ? 'tmdb-enriched' : 'moviesda-fallback',
             // Explicit source tracking for debugging and Flutter
             metadata: {
                 poster_from: posterSource,
                 overview_from: overviewSource,
-                source: metadataSource
+                source: metadataSource,
+                tmdb_status: tmdbStatus
             }
         };
     } catch (err) {
         logger.error(`Enrichment failed for "${movie.title}":`, err.message);
+
+        // Determine status even on error
+        const currentYear = new Date().getFullYear();
+        const movieYear = parseInt(movie.year);
+        let tmdbStatus = 'not_found';
+        if (movieYear >= (currentYear - 1) || !movieYear) {
+            tmdbStatus = 'pending';
+        }
+
         return {
             ...movie,
+            tmdb_id: movie.tmdb_id || null,
+            tmdb_status: tmdbStatus,
+            synopsis: movie.synopsis || movie.description || (tmdbStatus === 'pending'
+                ? 'Official metadata pending release. We will update as soon as it becomes available.'
+                : 'Description currently unavailable.'),
             source: 'moviesda-fallback',
             metadata: {
                 poster_from: 'original',
                 overview_from: 'original',
-                source: 'error-fallback'
+                source: 'error-fallback',
+                tmdb_status: tmdbStatus
             }
         };
     }
